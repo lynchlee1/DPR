@@ -528,10 +528,6 @@ export function App() {
           <span className="app-mark"><ImageSquare size={19} weight="fill" /></span>
           <span className="app-name">사진 정리</span>
         </div>
-        <div className="titlebar-path" title={folder}>
-          <FolderOpen size={15} />
-          <span>{shortPath(folder)}</span>
-        </div>
         <div className="titlebar-actions">
           <button ref={helpButtonRef} className="button button-secondary compact" onClick={() => setGuide({ kind: "menu", step: 0 })}>
             <Question size={16} weight="bold" />사용법
@@ -847,9 +843,6 @@ type ReviewProps = {
 function ReviewWorkspace(props: ReviewProps) {
   const { result, group, groupIndex, selectedPhoto } = props;
   const visibleColumns = Math.min(group.images.length, 3);
-  const groupMarkedCount = group.images.filter((image) => image.marked).length;
-  const groupKeptCount = group.images.length - groupMarkedCount;
-  const keepsAutomaticQuickChoice = groupKeptCount === 1 && group.images.some((image) => image.id === group.keep_id && !image.marked);
   return (
     <div className="review-workspace">
       <div className="review-toolbar" data-guide="review-toolbar">
@@ -860,12 +853,6 @@ function ReviewWorkspace(props: ReviewProps) {
           <span>{group.member_count}장</span>
           <span>{group.folder_count}개 폴더</span>
         </div>
-        {props.mode === "quick" && (
-          <div className="quick-review-plan" aria-label={`이 그룹에서 ${groupMarkedCount}장 삭제 후보, ${groupKeptCount}장 보존`}>
-            <span className="quick-delete"><Trash size={13} weight="fill" />삭제 후보 {groupMarkedCount}</span>
-            <span className="quick-keep"><Check size={13} weight="bold" />보존 {groupKeptCount}장 ({keepsAutomaticQuickChoice ? "추천" : "직접 선택"})</span>
-          </div>
-        )}
         <div className="group-navigation">
           <button className="icon-button" aria-label="이전 그룹" onClick={props.onPrevious} disabled={groupIndex === 0}><ArrowLeft size={18} /></button>
           <button className="icon-button" aria-label="다음 그룹" onClick={props.onNext} disabled={groupIndex === result.groups.length - 1}><ArrowRight size={18} /></button>

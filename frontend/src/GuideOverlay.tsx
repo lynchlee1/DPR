@@ -11,7 +11,7 @@ import {
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 
 export type GuideKind = "menu" | "setup" | "review" | "shortcuts";
 
@@ -41,8 +41,8 @@ const SETUP_STEPS: GuideStep[] = [
   },
   {
     target: '[data-guide="mode"]',
-    title: "검토 방식을 선택하세요",
-    copy: "일반 분석은 모든 판단을 직접 내립니다. 빠른 분석은 보관할 사진을 추천하고 나머지를 후보로 준비합니다.",
+    title: "일반 분석과 빠른 분석의 차이",
+    copy: "일반 분석은 비슷한 사진만 묶고 삭제 후보는 정하지 않습니다. 사진마다 직접 보관 여부를 선택할 때 적합합니다. 빠른 분석은 그룹에서 가장 최근에 촬영한 사진을 보존 대상으로 추천하고, 나머지는 삭제 후보로 미리 표시합니다. 추천을 확인하며 그룹별로 빠르게 정리할 때 적합합니다.",
   },
   {
     target: '[data-guide="threshold"]',
@@ -107,6 +107,7 @@ export function GuideOverlay({
   const panelRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [targetRect, setTargetRect] = useState<TargetRect | null>(null);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties | undefined>();
   const steps = guide.kind === "setup" ? SETUP_STEPS : guide.kind === "review" ? REVIEW_STEPS : [];
   const currentStep = steps[guide.step];
 
@@ -143,7 +144,7 @@ export function GuideOverlay({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!currentStep) {
       setTargetRect(null);
       return;
@@ -162,11 +163,15 @@ export function GuideOverlay({
         return;
       }
       const padding = 6;
+      const left = Math.max(8, Math.min(window.innerWidth - 8, rect.left - padding));
+      const right = Math.max(8, Math.min(window.innerWidth - 8, rect.right + padding));
+      const top = Math.max(8, Math.min(window.innerHeight - 8, rect.top - padding));
+      const bottom = Math.max(8, Math.min(window.innerHeight - 8, rect.bottom + padding));
       setTargetRect({
-        top: Math.max(8, rect.top - padding),
-        left: Math.max(8, rect.left - padding),
-        width: Math.min(window.innerWidth - 16, rect.width + padding * 2),
-        height: Math.min(window.innerHeight - 16, rect.height + padding * 2),
+        top,
+        left,
+        width: Math.max(0, right - left),
+        height: Math.max(0, bottom - top),
       });
     }
 
@@ -185,6 +190,67 @@ export function GuideOverlay({
     };
   }, [currentStep]);
 
+  useLayoutEffect(() => {
+    if (!targetRect || !panelRef.current || window.innerWidth <= 760) {
+      setPopoverStyle(undefined);
+      return;
+    }
+    const panel = panelRef.current;
+    const activeTargetRect = targetRect;
+
+    function placePopover() {
+      const panelRect = panel.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const edge = 12;
+      const gap = 14;
+      const maxLeft = Math.max(edge, viewportWidth - panelRect.width - edge);
+      const maxTop = Math.max(edge, viewportHeight - panelRect.height - edge);
+      const clamp = (value: number, minimum: number, maximum: number) => Math.min(Math.max(value, minimum), maximum);
+      const alignedTop = clamp(activeTargetRect.top, edge, maxTop);
+      const centeredLeft = clamp(activeTargetRect.left + activeTargetRect.width / 2 - panelRect.width / 2, edge, maxLeft);
+
+      const right = activeTargetRect.left + activeTargetRect.width + gap;
+      if (right + panelRect.width <= viewportWidth - edge) {
+        setPopoverStyle({ left: right, top: alignedTop });
+        return;
+      }
+
+      const left = activeTargetRect.left - panelRect.width - gap;
+      if (left >= edge) {
+        setPopoverStyle({ left, top: alignedTop });
+        return;
+      }
+
+      const below = activeTargetRect.top + activeTargetRect.height + gap;
+      if (below + panelRect.height <= viewportHeight - edge) {
+        setPopoverStyle({ left: centeredLeft, top: below });
+        return;
+      }
+
+      const above = activeTargetRect.top - panelRect.height - gap;
+      if (above >= edge) {
+        setPopoverStyle({ left: centeredLeft, top: above });
+        return;
+      }
+
+      setPopoverStyle({
+        left: centeredLeft,
+        top: clamp(activeTargetRect.top + activeTargetRect.height / 2 - panelRect.height / 2, edge, maxTop),
+      });
+    }
+
+    const frame = window.requestAnimationFrame(placePopover);
+    const observer = new ResizeObserver(placePopover);
+    observer.observe(panel);
+    window.addEventListener("resize", placePopover);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", placePopover);
+    };
+  }, [targetRect, guide.kind, guide.step]);
+
   const spotlightStyle = targetRect
     ? ({
         "--guide-top": `${targetRect.top}px`,
@@ -193,12 +259,6 @@ export function GuideOverlay({
         "--guide-height": `${targetRect.height}px`,
       } as CSSProperties)
     : undefined;
-  const popoverStyle = targetRect
-    ? targetRect.top + targetRect.height + 250 < window.innerHeight
-      ? ({ top: targetRect.top + targetRect.height + 14, right: 20 } as CSSProperties)
-      : ({ bottom: Math.max(20, window.innerHeight - targetRect.top + 14), right: 20 } as CSSProperties)
-    : undefined;
-
   function previousStep() {
     if (guide.step > 0) onChange({ ...guide, step: guide.step - 1 });
   }
