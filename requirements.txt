@@ -1,0 +1,6 @@
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+Pillow==12.1.1
+numpy==2.4.3
+Send2Trash==1.8.3
+
