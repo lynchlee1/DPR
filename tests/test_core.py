@@ -68,7 +68,7 @@ def test_similarity_is_high_for_resized_copy_and_lower_for_different_image(tmp_p
     assert similarity(original, different) < 88
 
 
-def test_scan_only_compares_chronological_neighbors_inside_one_minute(tmp_path: Path) -> None:
+def test_scan_excludes_unrelated_chronological_neighbors_inside_one_minute(tmp_path: Path) -> None:
     save_image(tmp_path / "20240101_120000_first.jpg", (26, 93, 142))
     save_image(tmp_path / "20240101_120040_copy.jpg", (26, 93, 142))
     save_image(tmp_path / "20240101_120050_other.jpg", (170, 48, 35))
@@ -83,9 +83,26 @@ def test_scan_only_compares_chronological_neighbors_inside_one_minute(tmp_path: 
     assert [image["name"] for image in result["groups"][0]["images"]] == [
         "20240101_120000_first.jpg",
         "20240101_120040_copy.jpg",
-        "20240101_120050_other.jpg",
     ]
     assert sum(image["marked"] for image in result["groups"][0]["images"]) == 1
+
+
+def test_scan_splits_visual_matches_connected_only_by_capture_time(tmp_path: Path) -> None:
+    save_image(tmp_path / "20240101_120000_blue-a.jpg", (26, 93, 142))
+    save_image(tmp_path / "20240101_120010_blue-b.jpg", (26, 93, 142))
+    save_image(tmp_path / "20240101_120020_red-a.jpg", (170, 48, 35))
+    save_image(tmp_path / "20240101_120030_red-b.jpg", (170, 48, 35))
+
+    result = scan_folder(tmp_path, threshold=88, time_window_seconds=60, max_workers=2)
+
+    assert result["stats"]["groups"] == 2
+    assert [
+        [image["name"] for image in group["images"]]
+        for group in result["groups"]
+    ] == [
+        ["20240101_120000_blue-a.jpg", "20240101_120010_blue-b.jpg"],
+        ["20240101_120020_red-a.jpg", "20240101_120030_red-b.jpg"],
+    ]
 
 
 def test_scan_recurses_through_nested_photo_folders(tmp_path: Path) -> None:
@@ -143,3 +160,24 @@ def test_transitive_group_only_marks_images_above_keeper_threshold(tmp_path: Pat
     assert all(image["similarity_to_keep"] >= 90 for image in group["images"] if image["marked"])
     for image in group["images"]:
         assert image["similarity_by_id"][group["keep_id"]] == image["similarity_to_keep"]
+
+
+def test_quick_scan_keeps_latest_photo_and_marks_the_rest(tmp_path: Path) -> None:
+    for second in (0, 10, 20):
+        save_image(
+            tmp_path / f"20240101_1200{second:02d}.jpg",
+            (26, 93, 142),
+        )
+
+    result = scan_folder(
+        tmp_path,
+        threshold=96,
+        time_window_seconds=60,
+        max_workers=2,
+        keeper_strategy="latest",
+    )
+
+    group = result["groups"][0]
+    assert group["keep_id"] == group["images"][-1]["id"]
+    assert [image["marked"] for image in group["images"]] == [True, True, False]
+    assert result["stats"]["marked_count"] == 2

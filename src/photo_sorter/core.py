@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -225,37 +225,6 @@ def _quality_score(record: ImageRecord, records: Iterable[ImageRecord]) -> float
     return 0.55 * resolution + 0.25 * sharpness + 0.2 * file_size
 
 
-def _time_groups(
-    records: list[ImageRecord],
-    pairs_in_window: list[SimilarityPair],
-    matching_pairs: list[SimilarityPair],
-) -> list[list[ImageRecord]]:
-    if not records:
-        return []
-
-    within_window = {(pair.left_id, pair.right_id) for pair in pairs_in_window}
-    matching = {(pair.left_id, pair.right_id) for pair in matching_pairs}
-    groups: list[list[ImageRecord]] = []
-    current = [records[0]]
-    current_has_match = False
-
-    for left, right in zip(records, records[1:]):
-        link = (left.id, right.id)
-        if link in within_window:
-            current.append(right)
-            current_has_match = current_has_match or link in matching
-            continue
-
-        if current_has_match:
-            groups.append(current)
-        current = [right]
-        current_has_match = False
-
-    if current_has_match:
-        groups.append(current)
-    return groups
-
-
 def _matching_components(
     members: list[ImageRecord],
     pairs: list[SimilarityPair],
@@ -287,6 +256,7 @@ def scan_folder(
     time_window_seconds: int = 60,
     on_progress: ProgressCallback | None = None,
     max_workers: int | None = None,
+    keeper_strategy: Literal["quality", "latest"] = "quality",
 ) -> dict:
     started = time.perf_counter()
     folder = folder.expanduser().resolve()
@@ -296,6 +266,8 @@ def scan_folder(
         raise ValueError("유사도 기준은 0에서 100 사이여야 합니다.")
     if time_window_seconds < 1:
         raise ValueError("시간 간격은 1초 이상이어야 합니다.")
+    if keeper_strategy not in {"quality", "latest"}:
+        raise ValueError("보존 사진 선택 방식이 올바르지 않습니다.")
 
     paths = discover_images(folder)
     if on_progress:
@@ -335,7 +307,7 @@ def scan_folder(
         if on_progress:
             on_progress(index, pair_total, "comparing")
 
-    raw_groups = _time_groups(records, pairs_in_window, matching_pairs)
+    raw_groups = _matching_components(records, matching_pairs)
     groups: list[dict] = []
 
     for number, members in enumerate(raw_groups, start=1):
@@ -360,10 +332,16 @@ def scan_folder(
         reference_by_id = {member.id: member.id for member in members}
         component_keepers: list[ImageRecord] = []
         for component in components:
-            _, component_keeper = max(
-                enumerate(component),
-                key=lambda indexed: (_quality_score(indexed[1], component), -indexed[0]),
-            )
+            if keeper_strategy == "latest":
+                _, component_keeper = max(
+                    enumerate(component),
+                    key=lambda indexed: (indexed[1].captured_at, indexed[0]),
+                )
+            else:
+                _, component_keeper = max(
+                    enumerate(component),
+                    key=lambda indexed: (_quality_score(indexed[1], component), -indexed[0]),
+                )
             component_keepers.append(component_keeper)
             for member in component:
                 reference_by_id[member.id] = component_keeper.id
@@ -378,7 +356,8 @@ def scan_folder(
                     member,
                     folder,
                     score_to_keeper,
-                    member.id != reference_id and score_to_keeper >= threshold,
+                    member.id != reference_id
+                    and (keeper_strategy == "latest" or score_to_keeper >= threshold),
                     similarity_matrix[member.id],
                     reference_id,
                 )
@@ -405,6 +384,7 @@ def scan_folder(
         "folder": str(folder),
         "threshold": threshold,
         "time_window_seconds": time_window_seconds,
+        "keeper_strategy": keeper_strategy,
         "groups": groups,
         "failures": failures,
         "stats": {

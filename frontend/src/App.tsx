@@ -9,6 +9,7 @@ import {
   ImageSquare,
   Info,
   Keyboard,
+  Lightning,
   MagnifyingGlass,
   ShieldCheck,
   Sparkle,
@@ -19,6 +20,9 @@ import {
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 
 type ScanStatus = "queued" | "running" | "complete" | "error";
+type AnalysisMode = "standard" | "quick";
+
+const DEFAULT_QUICK_THRESHOLD = 96;
 
 type Photo = {
   id: string;
@@ -54,6 +58,7 @@ type ScanResult = {
   folder: string;
   threshold: number;
   time_window_seconds: number;
+  keeper_strategy: "quality" | "latest";
   groups: PhotoGroup[];
   failures: { path: string; reason: string }[];
   stats: {
@@ -74,6 +79,7 @@ type Session = {
   folder: string;
   threshold: number;
   time_window_seconds: number;
+  mode: AnalysisMode;
   status: ScanStatus;
   phase: "queued" | "analyzing" | "comparing" | "complete" | "error";
   completed: number;
@@ -195,15 +201,41 @@ function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult
   };
 }
 
+function removeReviewedGroups(result: ScanResult, throughGroupIndex: number, movedPaths: string[]): ScanResult {
+  const moved = new Set(movedPaths);
+  const completedGroupIds = new Set(
+    result.groups
+      .slice(0, throughGroupIndex + 1)
+      .filter((group) => group.images.filter((image) => image.marked).every((image) => moved.has(image.path)))
+      .map((group) => group.id),
+  );
+  const afterMove = removeMovedPhotos(result, movedPaths);
+  const groups = afterMove.groups.filter((group) => !completedGroupIds.has(group.id));
+  const marked = groups.flatMap((group) => group.images).filter((image) => image.marked);
+  return {
+    ...afterMove,
+    groups,
+    stats: {
+      ...afterMove.stats,
+      groups: groups.length,
+      marked_count: marked.length,
+      marked_bytes: marked.reduce((total, image) => total + image.size_bytes, 0),
+    },
+  };
+}
+
 export function App() {
   const [folder, setFolder] = useState(() => localStorage.getItem("photo-sorter-folder") || "");
   const [threshold, setThreshold] = useState(88);
+  const [quickThreshold, setQuickThreshold] = useState(DEFAULT_QUICK_THRESHOLD);
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("standard");
   const [session, setSession] = useState<Session | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
   const [selectedGroupIndex, setSelectedGroupIndex] = useState(0);
   const [selectedPhotoId, setSelectedPhotoId] = useState<string | null>(null);
   const [isPickingFolder, setIsPickingFolder] = useState(false);
   const [isTrashDialogOpen, setIsTrashDialogOpen] = useState(false);
+  const [trashThroughGroupIndex, setTrashThroughGroupIndex] = useState<number | null>(null);
   const [isTrashing, setIsTrashing] = useState(false);
   const [cleanupOutcome, setCleanupOutcome] = useState<CleanupOutcome | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -220,8 +252,20 @@ export function App() {
     [result],
   );
   const markedBytes = markedPhotos.reduce((total, image) => total + image.size_bytes, 0);
-  const fullyMarkedGroupCount =
-    result?.groups.filter((group) => group.images.length > 0 && group.images.every((image) => image.marked)).length ?? 0;
+  const groupsInTrashScope = result
+    ? trashThroughGroupIndex === null
+      ? result.groups
+      : result.groups.slice(0, trashThroughGroupIndex + 1)
+    : [];
+  const pendingTrashPhotos = groupsInTrashScope.flatMap((group) => group.images).filter((image) => image.marked);
+  const pendingTrashBytes = pendingTrashPhotos.reduce((total, image) => total + image.size_bytes, 0);
+  const fullyMarkedGroupCount = groupsInTrashScope.filter(
+    (group) => group.images.length > 0 && group.images.every((image) => image.marked),
+  ).length;
+  const throughCurrentMarkedPhotos =
+    result?.groups.slice(0, selectedGroupIndex + 1).flatMap((group) => group.images).filter((image) => image.marked) ?? [];
+  const throughCurrentMarkedBytes = throughCurrentMarkedPhotos.reduce((total, image) => total + image.size_bytes, 0);
+  const activeThreshold = analysisMode === "quick" ? quickThreshold : threshold;
 
   useEffect(() => {
     if (!session || session.status === "complete" || session.status === "error") return;
@@ -230,7 +274,7 @@ export function App() {
         const next = await api<Session>(`/api/scans/${session.id}`);
         setSession(next);
         if (next.status === "complete" && next.result) {
-          const initialResult = clearCandidateMarks(next.result);
+          const initialResult = next.mode === "quick" ? next.result : clearCandidateMarks(next.result);
           setResult(initialResult);
           setSelectedGroupIndex(0);
           setSelectedPhotoId(firstReviewPhoto(initialResult.groups[0])?.id ?? null);
@@ -244,12 +288,44 @@ export function App() {
   }, [session?.id, session?.status]);
 
   useEffect(() => {
+    if (!session || session.mode !== "quick" || !result) return;
+    const preloaders = result.groups
+      .slice(selectedGroupIndex + 1, selectedGroupIndex + 3)
+      .flatMap((group) => group.images)
+      .map((image) => {
+        const preloader = new Image();
+        preloader.decoding = "async";
+        preloader.src = imageUrl(session.id, image.id);
+        return preloader;
+      });
+    return () => {
+      preloaders.forEach((preloader) => {
+        preloader.onload = null;
+        preloader.onerror = null;
+      });
+    };
+  }, [session?.id, session?.mode, result, selectedGroupIndex]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (!result || isTrashDialogOpen) return;
       if (event.repeat) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
       const key = event.key.toLowerCase();
+      if (!event.shiftKey && /^[1-9]$/.test(key)) {
+        const photoIndex = Number(key) - 1;
+        const photo = currentGroup?.images[photoIndex];
+        if (photo) {
+          event.preventDefault();
+          setSelectedPhotoId(photo.id);
+          updateCurrentGroup((group) => ({
+            ...group,
+            images: group.images.map((image) => ({ ...image, marked: image.id !== photo.id })),
+          }));
+        }
+        return;
+      }
       if (event.shiftKey && (key === "a" || key === "n")) {
         event.preventDefault();
         markCurrentGroup(key === "a");
@@ -261,8 +337,14 @@ export function App() {
         if (key === "s" && selectedPhoto) setPhotoMarked(selectedPhoto.id, false);
         return;
       }
-      if (event.key === "ArrowRight") selectGroup(Math.min(selectedGroupIndex + 1, result.groups.length - 1));
-      if (event.key === "ArrowLeft") selectGroup(Math.max(selectedGroupIndex - 1, 0));
+      if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+        event.preventDefault();
+        selectGroup(
+          event.key === "ArrowRight"
+            ? Math.min(selectedGroupIndex + 1, result.groups.length - 1)
+            : Math.max(selectedGroupIndex - 1, 0),
+        );
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -295,7 +377,7 @@ export function App() {
       localStorage.setItem("photo-sorter-folder", folder);
       const next = await api<Session>("/api/scans", {
         method: "POST",
-        body: JSON.stringify({ folder, threshold, time_window_seconds: 60 }),
+        body: JSON.stringify({ folder, threshold: activeThreshold, time_window_seconds: 60, mode: analysisMode }),
       });
       setSession(next);
     } catch (scanError) {
@@ -350,36 +432,64 @@ export function App() {
     }));
   }
 
+  function openTrashDialog(throughGroupIndex: number | null) {
+    setTrashThroughGroupIndex(throughGroupIndex);
+    setIsTrashDialogOpen(true);
+  }
+
   async function trashMarked() {
-    if (!session || !result || markedPhotos.length === 0) return;
+    if (!session || !result || pendingTrashPhotos.length === 0) return;
+    const resultBeforeTrash = result;
+    const selectedPhotoIdBeforeTrash = selectedPhotoId;
+    const candidatePaths = pendingTrashPhotos.map((image) => image.path);
+    const processedThroughGroupIndex = trashThroughGroupIndex;
+
+    function showRemainingPhotos(nextResult: ScanResult, preferredPhotoId: string | null, preferredGroupIndex?: number) {
+      setResult(nextResult);
+      if (nextResult.groups.length === 0) {
+        setSelectedGroupIndex(0);
+        setSelectedPhotoId(null);
+        return;
+      }
+
+      const nextGroupIndex = preferredGroupIndex ?? Math.min(selectedGroupIndex, nextResult.groups.length - 1);
+      const nextGroup = nextResult.groups[nextGroupIndex];
+      const preservedSelection = nextGroup.images.find((image) => image.id === preferredPhotoId);
+      setSelectedGroupIndex(nextGroupIndex);
+      setSelectedPhotoId(preservedSelection?.id ?? firstReviewPhoto(nextGroup)?.id ?? null);
+    }
+
     setIsTrashing(true);
+    setIsTrashDialogOpen(false);
     setError(null);
+    // Remove pending cards before the files move so lazy image requests cannot
+    // race the trash operation and request a path that has just disappeared.
+    showRemainingPhotos(removeMovedPhotos(resultBeforeTrash, candidatePaths), selectedPhotoIdBeforeTrash);
     try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
       const outcome = await api<CleanupOutcome>(`/api/scans/${session.id}/trash`, {
         method: "POST",
         body: JSON.stringify({
-          image_ids: markedPhotos.map((image) => image.id),
+          image_ids: pendingTrashPhotos.map((image) => image.id),
           allow_delete_all: fullyMarkedGroupCount > 0,
         }),
       });
       setCleanupOutcome(outcome);
-      setIsTrashDialogOpen(false);
-      const remainingResult = removeMovedPhotos(result, outcome.moved);
-      setResult(remainingResult);
-      if (remainingResult.groups.length === 0) {
-        setSelectedGroupIndex(0);
-        setSelectedPhotoId(null);
+      if (processedThroughGroupIndex === null) {
+        showRemainingPhotos(removeMovedPhotos(resultBeforeTrash, outcome.moved), selectedPhotoIdBeforeTrash);
       } else {
-        const nextGroupIndex = Math.min(selectedGroupIndex, remainingResult.groups.length - 1);
-        const nextGroup = remainingResult.groups[nextGroupIndex];
-        const preservedSelection = nextGroup.images.find((image) => image.id === selectedPhotoId);
-        setSelectedGroupIndex(nextGroupIndex);
-        setSelectedPhotoId(preservedSelection?.id ?? firstReviewPhoto(nextGroup)?.id ?? null);
+        showRemainingPhotos(
+          removeReviewedGroups(resultBeforeTrash, processedThroughGroupIndex, outcome.moved),
+          null,
+          0,
+        );
       }
     } catch (trashError) {
+      showRemainingPhotos(resultBeforeTrash, selectedPhotoIdBeforeTrash);
       setError(trashError instanceof Error ? trashError.message : "휴지통으로 이동하지 못했습니다.");
     } finally {
       setIsTrashing(false);
+      setTrashThroughGroupIndex(null);
     }
   }
 
@@ -430,6 +540,33 @@ export function App() {
               </div>
             </div>
 
+            <span className="field-label" id="analysis-mode-label">분석 방식</span>
+            <div className="mode-selector" role="radiogroup" aria-labelledby="analysis-mode-label">
+              <button
+                className={analysisMode === "standard" ? "selected" : ""}
+                role="radio"
+                aria-checked={analysisMode === "standard"}
+                onClick={() => setAnalysisMode("standard")}
+                disabled={isScanning}
+              >
+                <MagnifyingGlass size={15} />일반 분석
+              </button>
+              <button
+                className={analysisMode === "quick" ? "selected" : ""}
+                role="radio"
+                aria-checked={analysisMode === "quick"}
+                onClick={() => setAnalysisMode("quick")}
+                disabled={isScanning}
+              >
+                <Lightning size={15} weight="fill" />빠른 분석
+              </button>
+            </div>
+            <p className="mode-help">
+              {analysisMode === "quick"
+                ? "선택한 기준을 넘는 사진에서 마지막 촬영 1장을 자동 보존합니다."
+                : "유사도 기준을 직접 정하고 모든 판단을 검토 중에 내립니다."}
+            </p>
+
             <label className="field-label" htmlFor="folder-path">사진 폴더</label>
             <div className="path-input-row">
               <input
@@ -447,7 +584,7 @@ export function App() {
             <div className="setting-block">
               <div className="setting-row">
                 <label htmlFor="similarity">유사도 기준</label>
-                <output htmlFor="similarity">{threshold}% 이상</output>
+                <output htmlFor="similarity">{activeThreshold}% 이상</output>
               </div>
               <input
                 id="similarity"
@@ -455,28 +592,37 @@ export function App() {
                 type="range"
                 min="70"
                 max="99"
-                value={threshold}
-                onChange={(event) => setThreshold(Number(event.target.value))}
+                value={activeThreshold}
+                onChange={(event) => {
+                  const nextThreshold = Number(event.target.value);
+                  if (analysisMode === "quick") setQuickThreshold(nextThreshold);
+                  else setThreshold(nextThreshold);
+                }}
                 disabled={isScanning}
               />
               <div className="range-labels"><span>넓게 찾기</span><span>거의 동일</span></div>
             </div>
 
             <div className="fixed-setting">
-              <div className="fixed-setting-icon"><MagnifyingGlass size={16} /></div>
-              <div><strong>하위 폴더 포함 · 인접 1분</strong><span>모든 사진을 시간순으로 모아 비교</span></div>
+              <div className="fixed-setting-icon">
+                {analysisMode === "quick" ? <Lightning size={16} weight="fill" /> : <MagnifyingGlass size={16} />}
+              </div>
+              <div>
+                <strong>{analysisMode === "quick" ? `${quickThreshold}% 기준 · 마지막 촬영 보존` : "하위 폴더 포함 · 인접 1분"}</strong>
+                <span>{analysisMode === "quick" ? "앞선 사진은 삭제 후보로 미리 지정" : "모든 사진을 시간순으로 모아 비교"}</span>
+              </div>
             </div>
 
             <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim()}>
-              <Sparkle size={17} weight="fill" />
-              {isScanning ? "분석 중" : result ? "다시 분석" : "사진 분석"}
+              {analysisMode === "quick" ? <Lightning size={17} weight="fill" /> : <Sparkle size={17} weight="fill" />}
+              {isScanning ? "분석 중" : analysisMode === "quick" ? "빠른 분석 시작" : result ? "다시 분석" : "사진 분석"}
             </button>
           </section>
 
           {result && result.groups.length > 0 && session && (
             <section className="group-list-section" aria-label="유사 사진 그룹">
               <div className="group-list-heading">
-                <h2>유사 사진 그룹</h2>
+                <h2>{session.mode === "quick" ? "빠른 검토 그룹" : "유사 사진 그룹"}</h2>
                 <span>{result.groups.length}</span>
               </div>
               <div className="group-list">
@@ -519,6 +665,9 @@ export function App() {
               selectedPhoto={selectedPhoto}
               markedCount={markedPhotos.length}
               markedBytes={markedBytes}
+              throughCurrentMarkedCount={throughCurrentMarkedPhotos.length}
+              throughCurrentMarkedBytes={throughCurrentMarkedBytes}
+              mode={session.mode}
               onPrevious={() => selectGroup(Math.max(0, selectedGroupIndex - 1))}
               onNext={() => selectGroup(Math.min(result.groups.length - 1, selectedGroupIndex + 1))}
               onSelectPhoto={setSelectedPhotoId}
@@ -526,21 +675,23 @@ export function App() {
               onMarkAll={() => markCurrentGroup(true)}
               onKeepAll={() => markCurrentGroup(false)}
               onSwipeDecision={applySwipeDecision}
-              onTrash={() => setIsTrashDialogOpen(true)}
+              onTrash={() => openTrashDialog(null)}
+              onTrashThrough={() => openTrashDialog(selectedGroupIndex)}
             />
           ) : (
-            <WelcomeView onChoose={pickFolder} onScan={startScan} folder={folder} />
+            <WelcomeView onChoose={pickFolder} onScan={startScan} folder={folder} mode={analysisMode} threshold={activeThreshold} />
           )}
         </main>
       </div>
 
       {isTrashDialogOpen && (
         <TrashDialog
-          count={markedPhotos.length}
-          bytes={markedBytes}
+          count={pendingTrashPhotos.length}
+          bytes={pendingTrashBytes}
+          partial={trashThroughGroupIndex !== null}
           fullyMarkedGroupCount={fullyMarkedGroupCount}
           loading={isTrashing}
-          onCancel={() => setIsTrashDialogOpen(false)}
+          onCancel={() => { setIsTrashDialogOpen(false); setTrashThroughGroupIndex(null); }}
           onConfirm={trashMarked}
         />
       )}
@@ -548,15 +699,30 @@ export function App() {
   );
 }
 
-function WelcomeView({ onChoose, onScan, folder }: { onChoose: () => void; onScan: () => void; folder: string }) {
+function WelcomeView({
+  onChoose,
+  onScan,
+  folder,
+  mode,
+  threshold,
+}: {
+  onChoose: () => void;
+  onScan: () => void;
+  folder: string;
+  mode: AnalysisMode;
+  threshold: number;
+}) {
   return (
     <div className="welcome-view">
-      <div className="welcome-icon"><ImageSquare size={38} weight="duotone" /></div>
-      <h1>비슷한 사진을 안전하게 정리하세요</h1>
-      <p>선택한 폴더의 모든 하위 사진 폴더를 탐색하고, 촬영 시간순으로 정렬한 뒤 1분 이내의 인접 사진만 비교합니다. 모든 처리는 이 Mac에서 끝납니다.</p>
+      <div className="welcome-icon">{mode === "quick" ? <Lightning size={38} weight="duotone" /> : <ImageSquare size={38} weight="duotone" />}</div>
+      <h1>{mode === "quick" ? "확실한 중복부터 빠르게 검토하세요" : "비슷한 사진을 안전하게 정리하세요"}</h1>
+      <p>{mode === "quick" ? `${threshold}% 이상 일치하는 사진을 모아 마지막 촬영본은 보존하고 나머지는 삭제 후보로 준비합니다. 실제 삭제 전에는 모든 그룹을 확인할 수 있습니다.` : "선택한 폴더의 모든 하위 사진 폴더를 탐색하고, 촬영 시간순으로 정렬한 뒤 1분 이내의 인접 사진만 비교합니다. 모든 처리는 이 Mac에서 끝납니다."}</p>
       <div className="welcome-actions">
         <button className="button button-secondary" onClick={onChoose}><FolderOpen size={17} />다른 폴더 선택</button>
-        <button className="button button-primary" onClick={onScan} disabled={!folder}><Sparkle size={17} weight="fill" />분석 시작</button>
+        <button className="button button-primary" onClick={onScan} disabled={!folder}>
+          {mode === "quick" ? <Lightning size={17} weight="fill" /> : <Sparkle size={17} weight="fill" />}
+          {mode === "quick" ? "빠른 분석" : "분석 시작"}
+        </button>
       </div>
       <div className="workflow-notes">
         <div><span>1</span><strong>하위 폴더 탐색</strong><small>사진을 재귀적으로 수집</small></div>
@@ -569,11 +735,13 @@ function WelcomeView({ onChoose, onScan, folder }: { onChoose: () => void; onSca
 
 function ScanningView({ session }: { session: Session }) {
   const progress = session.total ? Math.round((session.completed / session.total) * 100) : 0;
-  const phaseLabel = session.phase === "comparing" ? "인접 사진 비교 중" : "사진 정보와 지문 분석 중";
+  const phaseLabel = session.phase === "comparing"
+    ? session.mode === "quick" ? "확실한 중복 사진 비교 중" : "인접 사진 비교 중"
+    : "사진 정보와 지문 분석 중";
   return (
     <div className="scanning-view" aria-live="polite">
       <div className="scan-status-row">
-        <div className="scan-icon"><MagnifyingGlass size={22} /></div>
+        <div className="scan-icon">{session.mode === "quick" ? <Lightning size={22} weight="fill" /> : <MagnifyingGlass size={22} />}</div>
         <div><h1>{phaseLabel}</h1><p>{shortPath(session.folder)}</p></div>
         <strong>{progress}%</strong>
       </div>
@@ -620,6 +788,9 @@ type ReviewProps = {
   selectedPhoto: Photo;
   markedCount: number;
   markedBytes: number;
+  throughCurrentMarkedCount: number;
+  throughCurrentMarkedBytes: number;
+  mode: AnalysisMode;
   onPrevious: () => void;
   onNext: () => void;
   onSelectPhoto: (id: string) => void;
@@ -628,11 +799,15 @@ type ReviewProps = {
   onKeepAll: () => void;
   onSwipeDecision: (id: string, marked: boolean) => void;
   onTrash: () => void;
+  onTrashThrough: () => void;
 };
 
 function ReviewWorkspace(props: ReviewProps) {
   const { result, group, groupIndex, selectedPhoto } = props;
   const visibleColumns = Math.min(group.images.length, 3);
+  const groupMarkedCount = group.images.filter((image) => image.marked).length;
+  const groupKeptCount = group.images.length - groupMarkedCount;
+  const keepsAutomaticQuickChoice = groupKeptCount === 1 && group.images.some((image) => image.id === group.keep_id && !image.marked);
   return (
     <div className="review-workspace">
       <div className="review-toolbar">
@@ -643,6 +818,12 @@ function ReviewWorkspace(props: ReviewProps) {
           <span>{group.member_count}장</span>
           <span>{group.folder_count}개 폴더</span>
         </div>
+        {props.mode === "quick" && (
+          <div className="quick-review-plan" aria-label={`이 그룹에서 ${groupMarkedCount}장 삭제 후보, ${groupKeptCount}장 보존`}>
+            <span className="quick-delete"><Trash size={13} weight="fill" />삭제 후보 {groupMarkedCount}</span>
+            <span className="quick-keep"><Check size={13} weight="bold" />보존 {groupKeptCount}장 ({keepsAutomaticQuickChoice ? "마지막 촬영 우선" : "직접 선택"})</span>
+          </div>
+        )}
         <div className="group-navigation">
           <button className="icon-button" aria-label="이전 그룹" onClick={props.onPrevious} disabled={groupIndex === 0}><ArrowLeft size={18} /></button>
           <button className="icon-button" aria-label="다음 그룹" onClick={props.onNext} disabled={groupIndex === result.groups.length - 1}><ArrowRight size={18} /></button>
@@ -654,12 +835,14 @@ function ReviewWorkspace(props: ReviewProps) {
         style={{ "--gallery-columns": visibleColumns } as CSSProperties}
         aria-label={`그룹 ${groupIndex + 1} 사진 ${group.images.length}장`}
       >
-        {group.images.map((image) => (
+        {group.images.map((image, index) => (
           <SwipePhotoViewer
             key={image.id}
             scanId={props.scanId}
             photo={image}
             selected={image.id === selectedPhoto.id}
+            shortcutNumber={index < 9 ? index + 1 : null}
+            keepLabel={props.mode === "quick" ? image.id === group.keep_id ? "마지막 촬영 보존" : "보존" : "보관"}
             onSelect={() => props.onSelectPhoto(image.id)}
             onSave={() => props.onSwipeDecision(image.id, false)}
             onDelete={() => props.onSwipeDecision(image.id, true)}
@@ -676,14 +859,15 @@ function ReviewWorkspace(props: ReviewProps) {
           </div>
         </div>
         <div className="filmstrip">
-          {group.images.map((image) => (
+          {group.images.map((image, index) => (
             <button
               key={image.id}
               className={`filmstrip-item ${image.id === selectedPhoto.id ? "selected" : ""} ${image.marked ? "marked" : "kept"}`}
               onClick={() => props.onSelectPhoto(image.id)}
-              aria-label={`${image.relative_path}, ${image.marked ? "삭제 후보" : "보관"}`}
+              aria-label={`${index < 9 ? `${index + 1}번, ` : ""}${image.relative_path}, ${image.marked ? "삭제 후보" : "보관"}`}
             >
               <img src={imageUrl(props.scanId, image.id, "thumb")} alt="" loading="lazy" decoding="async" />
+              {index < 9 && <kbd className="filmstrip-shortcut">{index + 1}</kbd>}
               <span>{image.marked ? <WarningCircle size={12} weight="fill" /> : <Check size={12} weight="bold" />}</span>
             </button>
           ))}
@@ -691,19 +875,31 @@ function ReviewWorkspace(props: ReviewProps) {
       </div>
 
       <div className="actionbar">
-        <div className="keyboard-hint"><Keyboard size={16} /><span><kbd>⇧S</kbd> 보관</span><span><kbd>⇧D</kbd> 후보</span></div>
+        <div className="keyboard-hint">
+          <Keyboard size={16} />
+          {props.mode === "quick" && <span><kbd>←</kbd><kbd>→</kbd> 그룹 이동</span>}
+          <span><kbd>1-9</kbd> 1장만 보관</span>
+          <span><kbd>⇧S</kbd> 보관</span>
+          <span><kbd>⇧D</kbd> 후보</span>
+        </div>
         <div className="candidate-summary" aria-live="polite">
-          <span>삭제 후보</span>
-          <strong>{props.markedCount.toLocaleString()}건</strong>
-          <small>{formatBytes(props.markedBytes)}</small>
+          <span>{props.mode === "quick" ? "여기까지 후보" : "삭제 후보"}</span>
+          <strong>{(props.mode === "quick" ? props.throughCurrentMarkedCount : props.markedCount).toLocaleString()}건</strong>
+          <small>{formatBytes(props.mode === "quick" ? props.throughCurrentMarkedBytes : props.markedBytes)}</small>
         </div>
         <div className="review-actions">
           <button className={`button ${selectedPhoto.marked ? "button-secondary" : "button-danger-soft"}`} onClick={props.onToggleMarked}>
             {selectedPhoto.marked ? <Check size={16} weight="bold" /> : <WarningCircle size={16} weight="fill" />}
             {selectedPhoto.marked ? "후보 해제" : "후보 추가"}
           </button>
-          <button className="button button-danger" onClick={props.onTrash} disabled={props.markedCount === 0}>
-            <Trash size={16} weight="fill" />후보 {props.markedCount.toLocaleString()}건 삭제<span>{formatBytes(props.markedBytes)}</span>
+          <button
+            className="button button-danger"
+            onClick={props.mode === "quick" ? props.onTrashThrough : props.onTrash}
+            disabled={(props.mode === "quick" ? props.throughCurrentMarkedCount : props.markedCount) === 0}
+          >
+            <Trash size={16} weight="fill" />
+            {props.mode === "quick" ? "여기까지 정리하기" : `후보 ${props.markedCount.toLocaleString()}건 삭제`}
+            <span>{formatBytes(props.mode === "quick" ? props.throughCurrentMarkedBytes : props.markedBytes)}</span>
           </button>
         </div>
       </div>
@@ -715,6 +911,8 @@ function SwipePhotoViewer({
   scanId,
   photo,
   selected,
+  shortcutNumber,
+  keepLabel,
   onSelect,
   onSave,
   onDelete,
@@ -722,6 +920,8 @@ function SwipePhotoViewer({
   scanId: string;
   photo: Photo;
   selected: boolean;
+  shortcutNumber: number | null;
+  keepLabel: string;
   onSelect: () => void;
   onSave: () => void;
   onDelete: () => void;
@@ -836,9 +1036,9 @@ function SwipePhotoViewer({
         onPointerUp={finishSwipe}
         onPointerCancel={(event) => finishSwipe(event, true)}
         onDragStart={(event) => event.preventDefault()}
-        aria-label={`${photo.relative_path}. 위로 밀면 보관, 아래로 밀면 삭제 후보`}
+        aria-label={`${shortcutNumber ? `${shortcutNumber}번. ` : ""}${photo.relative_path}. 위로 밀면 보관, 아래로 밀면 삭제 후보${shortcutNumber ? `. 숫자키 ${shortcutNumber}로 이 사진만 보관` : ""}`}
       >
-        <PhotoViewer scanId={scanId} photo={photo} label={photo.marked ? "삭제 후보" : "보관"} tone={photo.marked ? "delete" : "keep"} />
+        <PhotoViewer scanId={scanId} photo={photo} shortcutNumber={shortcutNumber} label={photo.marked ? "삭제 후보" : keepLabel} tone={photo.marked ? "delete" : "keep"} />
         <div className="swipe-guide" aria-hidden="true">
           <span className="save"><ArrowUp size={13} weight="bold" />보관</span>
           <span>세로로 밀기</span>
@@ -849,10 +1049,23 @@ function SwipePhotoViewer({
   );
 }
 
-function PhotoViewer({ scanId, photo, label, tone }: { scanId: string; photo: Photo; label: string; tone: "keep" | "delete" }) {
+function PhotoViewer({
+  scanId,
+  photo,
+  shortcutNumber,
+  label,
+  tone,
+}: {
+  scanId: string;
+  photo: Photo;
+  shortcutNumber: number | null;
+  label: string;
+  tone: "keep" | "delete";
+}) {
   return (
     <article className={`photo-viewer ${tone}`}>
       <div className="photo-viewer-header">
+        {shortcutNumber && <kbd className="photo-shortcut" aria-label={`숫자키 ${shortcutNumber}`}>{shortcutNumber}</kbd>}
         <span className="status-label">{tone === "keep" ? <Check size={13} weight="bold" /> : <Trash size={13} weight="fill" />}{label}</span>
         <strong title={photo.relative_path}>{photo.name}</strong>
       </div>
@@ -870,6 +1083,7 @@ function PhotoViewer({ scanId, photo, label, tone }: { scanId: string; photo: Ph
 function TrashDialog({
   count,
   bytes,
+  partial,
   fullyMarkedGroupCount,
   loading,
   onCancel,
@@ -877,6 +1091,7 @@ function TrashDialog({
 }: {
   count: number;
   bytes: number;
+  partial: boolean;
   fullyMarkedGroupCount: number;
   loading: boolean;
   onCancel: () => void;
@@ -888,7 +1103,10 @@ function TrashDialog({
         <button className="modal-close" aria-label="닫기" onClick={onCancel} disabled={loading}><X size={18} /></button>
         <div className="modal-icon"><Trash size={24} weight="duotone" /></div>
         <h2 id="trash-title">{count.toLocaleString()}장을 휴지통으로 옮길까요?</h2>
-        <p>약 {formatBytes(bytes)}의 공간을 확보할 수 있습니다. 파일은 영구 삭제되지 않으며 Finder의 휴지통에서 복원할 수 있습니다.</p>
+        <p>
+          {partial ? "현재 그룹까지 검토한 삭제 후보만 이동합니다. 뒤쪽의 미검토 그룹은 그대로 남습니다. " : ""}
+          약 {formatBytes(bytes)}의 공간을 확보할 수 있습니다. 파일은 Finder의 휴지통에서 복원할 수 있습니다.
+        </p>
         {fullyMarkedGroupCount > 0 ? (
           <div className="safety-note destructive"><WarningCircle size={17} weight="fill" />{fullyMarkedGroupCount}개 그룹은 사진이 한 장도 남지 않습니다.</div>
         ) : (
@@ -896,7 +1114,7 @@ function TrashDialog({
         )}
         <div className="modal-actions">
           <button className="button button-secondary" onClick={onCancel} disabled={loading}>취소</button>
-          <button className="button button-danger" onClick={onConfirm} disabled={loading}><Trash size={16} weight="fill" />{loading ? "옮기는 중" : fullyMarkedGroupCount > 0 ? "전부 포함해 이동" : "휴지통으로 이동"}</button>
+          <button className="button button-danger" onClick={onConfirm} disabled={loading}><Trash size={16} weight="fill" />{loading ? "옮기는 중" : partial ? "여기까지 이동" : fullyMarkedGroupCount > 0 ? "전부 포함해 이동" : "휴지통으로 이동"}</button>
         </div>
       </div>
     </div>
