@@ -139,9 +139,7 @@ function clearCandidateMarks(result: ScanResult): ScanResult {
 }
 
 function firstReviewPhoto(group: PhotoGroup | undefined): Photo | undefined {
-  return group?.images.find((image) => image.marked && image.id !== image.reference_id)
-    ?? group?.images.find((image) => image.id !== image.reference_id)
-    ?? group?.images[0];
+  return group?.images.find((image) => image.marked) ?? group?.images[0];
 }
 
 function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult {
@@ -166,7 +164,7 @@ function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult
         ...image,
         reference_id: referenceId,
         similarity_to_keep: image.similarity_by_id[referenceId] ?? (image.id === referenceId ? 100 : image.similarity_to_keep),
-        marked: image.id === referenceId ? false : image.marked,
+        marked: image.marked,
       };
     });
     const keepIds = [...new Set(images.map((image) => image.reference_id))];
@@ -212,10 +210,6 @@ export function App() {
     currentGroup?.images.find((image) => image.id === selectedPhotoId) ??
     firstReviewPhoto(currentGroup ?? undefined) ??
     null;
-  const keeper =
-    currentGroup?.images.find((image) => image.id === selectedPhoto?.reference_id) ??
-    currentGroup?.images.find((image) => image.id === currentGroup.keep_id) ??
-    null;
 
   const markedPhotos = useMemo(
     () => result?.groups.flatMap((group) => group.images).filter((image) => image.marked) ?? [],
@@ -257,11 +251,10 @@ export function App() {
         markCurrentGroup(key === "a");
         return;
       }
-      if (event.shiftKey && (key === "d" || key === "s" || key === "k")) {
+      if (event.shiftKey && (key === "d" || key === "s")) {
         event.preventDefault();
         if (key === "d" && selectedPhoto) setPhotoMarked(selectedPhoto.id, true);
         if (key === "s" && selectedPhoto) setPhotoMarked(selectedPhoto.id, false);
-        if (key === "k" && selectedPhoto) setKeeper(selectedPhoto.id);
         return;
       }
       if (event.key === "ArrowRight") selectGroup(Math.min(selectedGroupIndex + 1, result.groups.length - 1));
@@ -325,10 +318,6 @@ export function App() {
   function setPhotoMarked(imageId: string, marked: boolean): boolean {
     const image = currentGroup?.images.find((item) => item.id === imageId);
     if (!image) return false;
-    if (marked && image.id === image.reference_id) {
-      setError("비교 기준 사진을 후보로 바꾸려면 먼저 다른 사진을 보관본으로 지정해 주세요.");
-      return false;
-    }
     updateCurrentGroup((group) => {
       return {
         ...group,
@@ -345,53 +334,9 @@ export function App() {
     if (image) setPhotoMarked(imageId, !image.marked);
   }
 
-  function applySwipeDecision(marked: boolean) {
-    if (!currentGroup || !selectedPhoto) return;
-    const currentIndex = currentGroup.images.findIndex((image) => image.id === selectedPhoto.id);
-    if (!setPhotoMarked(selectedPhoto.id, marked)) return;
-    const nextPhoto = currentGroup.images
-      .slice(currentIndex + 1)
-      .find((image) => image.id !== image.reference_id);
-    if (nextPhoto) {
-      setSelectedPhotoId(nextPhoto.id);
-    } else if (result && selectedGroupIndex < result.groups.length - 1) {
-      selectGroup(selectedGroupIndex + 1);
-    }
-  }
-
-  function setKeeper(imageId: string) {
-    if (!selectedPhoto) return;
-    const previousReferenceId = selectedPhoto.reference_id;
-    updateCurrentGroup((group) => {
-      const images = group.images.map((image) => {
-        if (image.reference_id !== previousReferenceId) return image;
-        const score = image.similarity_by_id[imageId] ?? 0;
-        return {
-          ...image,
-          reference_id: imageId,
-          similarity_to_keep: score,
-          marked: image.id !== imageId && score >= (result?.threshold ?? threshold),
-        };
-      });
-      return {
-        ...group,
-        keep_id: group.keep_id === previousReferenceId ? imageId : group.keep_id,
-        keep_ids: [...new Set(images.map((image) => image.reference_id))],
-        images,
-      };
-    });
-    setSelectedPhotoId(previousReferenceId);
-  }
-
-  function resetAutoMarks() {
-    if (!currentGroup) return;
-    updateCurrentGroup((group) => ({
-      ...group,
-      images: group.images.map((image) => ({
-        ...image,
-        marked: image.id !== image.reference_id && image.similarity_to_keep >= (result?.threshold ?? threshold),
-      })),
-    }));
+  function applySwipeDecision(imageId: string, marked: boolean) {
+    setSelectedPhotoId(imageId);
+    setPhotoMarked(imageId, marked);
   }
 
   function markCurrentGroup(marked: boolean) {
@@ -561,13 +506,12 @@ export function App() {
             <ScanningView session={session} />
           ) : result && result.groups.length === 0 ? (
             <EmptyResults result={result} onRescan={startScan} />
-          ) : result && currentGroup && keeper && selectedPhoto && session ? (
+          ) : result && currentGroup && selectedPhoto && session ? (
             <ReviewWorkspace
               scanId={session.id}
               result={result}
               group={currentGroup}
               groupIndex={selectedGroupIndex}
-              keeper={keeper}
               selectedPhoto={selectedPhoto}
               markedCount={markedPhotos.length}
               markedBytes={markedBytes}
@@ -575,12 +519,9 @@ export function App() {
               onNext={() => selectGroup(Math.min(result.groups.length - 1, selectedGroupIndex + 1))}
               onSelectPhoto={setSelectedPhotoId}
               onToggleMarked={() => toggleMarked(selectedPhoto.id)}
-              onSetKeeper={() => setKeeper(selectedPhoto.id)}
-              onResetMarks={resetAutoMarks}
               onMarkAll={() => markCurrentGroup(true)}
               onKeepAll={() => markCurrentGroup(false)}
-              onSwipeSave={() => applySwipeDecision(false)}
-              onSwipeDelete={() => applySwipeDecision(true)}
+              onSwipeDecision={applySwipeDecision}
               onTrash={() => setIsTrashDialogOpen(true)}
             />
           ) : (
@@ -672,7 +613,6 @@ type ReviewProps = {
   result: ScanResult;
   group: PhotoGroup;
   groupIndex: number;
-  keeper: Photo;
   selectedPhoto: Photo;
   markedCount: number;
   markedBytes: number;
@@ -680,17 +620,15 @@ type ReviewProps = {
   onNext: () => void;
   onSelectPhoto: (id: string) => void;
   onToggleMarked: () => void;
-  onSetKeeper: () => void;
-  onResetMarks: () => void;
   onMarkAll: () => void;
   onKeepAll: () => void;
-  onSwipeSave: () => void;
-  onSwipeDelete: () => void;
+  onSwipeDecision: (id: string, marked: boolean) => void;
   onTrash: () => void;
 };
 
 function ReviewWorkspace(props: ReviewProps) {
-  const { result, group, groupIndex, keeper, selectedPhoto } = props;
+  const { result, group, groupIndex, selectedPhoto } = props;
+  const visibleColumns = Math.min(group.images.length, 3);
   return (
     <div className="review-workspace">
       <div className="review-toolbar">
@@ -706,29 +644,28 @@ function ReviewWorkspace(props: ReviewProps) {
         </div>
       </div>
 
-      <div className="comparison-grid">
-        <PhotoViewer
-          scanId={props.scanId}
-          photo={keeper}
-          label={keeper.marked ? "삭제 후보" : "비교 기준"}
-          tone={keeper.marked ? "delete" : "keep"}
-        />
-        <div className="match-badge" aria-label={`유사도 ${selectedPhoto.similarity_to_keep}%`}>
-          <strong>{selectedPhoto.similarity_to_keep}%</strong><span>유사</span>
-        </div>
-        <SwipePhotoViewer
-          scanId={props.scanId}
-          photo={selectedPhoto}
-          onSave={props.onSwipeSave}
-          onDelete={props.onSwipeDelete}
-        />
+      <div
+        className="swipe-gallery"
+        style={{ "--gallery-columns": visibleColumns } as CSSProperties}
+        aria-label={`그룹 ${groupIndex + 1} 사진 ${group.images.length}장`}
+      >
+        {group.images.map((image) => (
+          <SwipePhotoViewer
+            key={image.id}
+            scanId={props.scanId}
+            photo={image}
+            selected={image.id === selectedPhoto.id}
+            onSelect={() => props.onSelectPhoto(image.id)}
+            onSave={() => props.onSwipeDecision(image.id, false)}
+            onDelete={() => props.onSwipeDecision(image.id, true)}
+          />
+        ))}
       </div>
 
       <div className="filmstrip-section">
         <div className="filmstrip-heading">
           <span>이 그룹의 사진</span>
           <div className="group-tools">
-            <button onClick={props.onResetMarks}><Sparkle size={14} weight="fill" />추천 복원</button>
             <button className="keep-all" onClick={props.onKeepAll}><Check size={14} weight="bold" />전부 보관 <kbd>⇧N</kbd></button>
             <button className="mark-all" onClick={props.onMarkAll}><WarningCircle size={14} weight="fill" />전부 후보 <kbd>⇧A</kbd></button>
           </div>
@@ -741,7 +678,7 @@ function ReviewWorkspace(props: ReviewProps) {
               onClick={() => props.onSelectPhoto(image.id)}
               aria-label={`${image.name}, ${image.marked ? "삭제 후보" : "보관"}`}
             >
-              <img src={imageUrl(props.scanId, image.id, "thumb")} alt="" />
+              <img src={imageUrl(props.scanId, image.id, "thumb")} alt="" loading="lazy" decoding="async" />
               <span>{image.marked ? <WarningCircle size={12} weight="fill" /> : <Check size={12} weight="bold" />}</span>
             </button>
           ))}
@@ -749,16 +686,13 @@ function ReviewWorkspace(props: ReviewProps) {
       </div>
 
       <div className="actionbar">
-        <div className="keyboard-hint"><Keyboard size={16} /><span><kbd>⇧S</kbd> 보관</span><span><kbd>⇧D</kbd> 후보</span><span><kbd>⇧K</kbd> 비교 기준</span></div>
+        <div className="keyboard-hint"><Keyboard size={16} /><span><kbd>⇧S</kbd> 보관</span><span><kbd>⇧D</kbd> 후보</span></div>
         <div className="candidate-summary" aria-live="polite">
           <span>삭제 후보</span>
           <strong>{props.markedCount.toLocaleString()}건</strong>
           <small>{formatBytes(props.markedBytes)}</small>
         </div>
         <div className="review-actions">
-          {selectedPhoto.id !== keeper.id && (
-            <button className="button button-secondary" onClick={props.onSetKeeper}><Check size={16} weight="bold" />보관본으로 지정</button>
-          )}
           <button className={`button ${selectedPhoto.marked ? "button-secondary" : "button-danger-soft"}`} onClick={props.onToggleMarked}>
             {selectedPhoto.marked ? <Check size={16} weight="bold" /> : <WarningCircle size={16} weight="fill" />}
             {selectedPhoto.marked ? "후보 해제" : "후보 추가"}
@@ -775,11 +709,15 @@ function ReviewWorkspace(props: ReviewProps) {
 function SwipePhotoViewer({
   scanId,
   photo,
+  selected,
+  onSelect,
   onSave,
   onDelete,
 }: {
   scanId: string;
   photo: Photo;
+  selected: boolean;
+  onSelect: () => void;
   onSave: () => void;
   onDelete: () => void;
 }) {
@@ -819,6 +757,7 @@ function SwipePhotoViewer({
     if (event.pointerType === "mouse" && event.button !== 0) return;
     if (completingRef.current) return;
     event.preventDefault();
+    onSelect();
     pointerIdRef.current = event.pointerId;
     startYRef.current = event.clientY;
     dragYRef.current = 0;
@@ -869,7 +808,7 @@ function SwipePhotoViewer({
   }
 
   return (
-    <div ref={slotRef} className="swipe-slot" data-swipe="idle" style={{ "--swipe-progress": 0 } as CSSProperties}>
+    <div ref={slotRef} className={`swipe-slot ${selected ? "selected" : ""}`} data-swipe="idle" style={{ "--swipe-progress": 0 } as CSSProperties}>
       <div className="swipe-decision-layer" aria-hidden="true">
         <div className="swipe-decision save">
           <ArrowUp size={32} weight="bold" />
@@ -885,6 +824,8 @@ function SwipePhotoViewer({
       <div
         ref={cardRef}
         className="swipe-card"
+        tabIndex={0}
+        onFocus={onSelect}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={finishSwipe}
@@ -910,7 +851,7 @@ function PhotoViewer({ scanId, photo, label, tone }: { scanId: string; photo: Ph
         <span className="status-label">{tone === "keep" ? <Check size={13} weight="bold" /> : <Trash size={13} weight="fill" />}{label}</span>
         <strong title={photo.name}>{photo.name}</strong>
       </div>
-      <div className="photo-stage"><img src={imageUrl(scanId, photo.id)} alt={photo.name} draggable={false} /></div>
+      <div className="photo-stage"><img src={imageUrl(scanId, photo.id)} alt={photo.name} draggable={false} loading="lazy" decoding="async" /></div>
       <dl className="photo-meta">
         <div><dt>촬영 시간</dt><dd>{formatDate(photo.captured_at)}</dd></div>
         <div><dt>크기</dt><dd>{photo.width.toLocaleString()} × {photo.height.toLocaleString()}</dd></div>
