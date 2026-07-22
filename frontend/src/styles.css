@@ -100,6 +100,7 @@ button:focus-visible, input:focus-visible {
 .app-name { font-size: var(--font-size-body); font-weight: 680; letter-spacing: -0.01em; }
 .titlebar-path { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--text-secondary); font-size: var(--font-size-label); }
 .titlebar-path span { max-width: 540px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.titlebar-actions { display: flex; align-items: center; gap: 7px; }
 
 .button {
   min-height: 36px;
@@ -461,6 +462,97 @@ kbd { min-width: 18px; height: 20px; display: inline-grid; place-items: center; 
 .safety-note.destructive { color: var(--danger); background: var(--danger-soft); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 22px; }
 
+/* Layer scale: app 0, confirmation modal 20, guided help 30. */
+.guide-overlay {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--viewer) 58%, transparent);
+  backdrop-filter: blur(4px);
+}
+.guide-overlay.has-target { display: block; padding: 0; background: transparent; backdrop-filter: none; }
+.guide-spotlight {
+  position: fixed;
+  z-index: 0;
+  top: var(--guide-top);
+  left: var(--guide-left);
+  width: var(--guide-width);
+  height: var(--guide-height);
+  border: 2px solid var(--accent);
+  border-radius: calc(var(--control-radius) + 3px);
+  box-shadow: 0 0 0 9999px color-mix(in srgb, var(--viewer) 68%, transparent), 0 0 0 4px color-mix(in srgb, var(--accent) 24%, transparent);
+  pointer-events: none;
+}
+.guide-dialog,
+.guide-popover {
+  color: var(--text);
+  background: var(--surface-strong);
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+.guide-dialog { position: relative; width: min(520px, 100%); max-height: calc(100dvh - 48px); padding: 28px; overflow-y: auto; }
+.guide-popover { position: fixed; z-index: 1; width: min(370px, calc(100vw - 40px)); padding: 20px; }
+.guide-overlay:not(.has-target) .guide-popover { position: relative; }
+.guide-close {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.guide-close:hover { background: var(--surface-hover); }
+.guide-icon { width: 46px; height: 46px; display: grid; place-items: center; margin-bottom: 17px; color: var(--accent); background: var(--accent-soft); border-radius: var(--radius); }
+.guide-dialog h2,
+.guide-popover h2 { margin: 0; font-size: var(--font-size-dialog); letter-spacing: -.025em; outline: none; }
+.guide-dialog > p,
+.guide-popover > p { margin: 9px 0 0; color: var(--text-secondary); font-size: var(--font-size-control); line-height: 1.6; }
+.guide-progress { display: flex; align-items: center; justify-content: space-between; margin-bottom: 11px; color: var(--text-tertiary); font-size: var(--font-size-caption); }
+.guide-progress button { padding: 0; color: var(--text-secondary); background: none; border: 0; font-size: var(--font-size-caption); cursor: pointer; }
+.guide-progress button:hover { color: var(--text); }
+.guide-footer { display: flex; align-items: center; justify-content: flex-end; gap: 7px; margin-top: 20px; }
+.guide-menu-actions { display: grid; gap: 8px; margin-top: 22px; }
+.guide-menu-item {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: 11px;
+  padding: 11px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--control-radius);
+  text-align: left;
+  cursor: pointer;
+}
+.guide-menu-item:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--line-strong); }
+.guide-menu-item:disabled { cursor: default; opacity: .48; }
+.guide-menu-item > span { grid-row: 1 / 3; width: 38px; height: 38px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border-radius: 8px; }
+.guide-menu-item strong { font-size: var(--font-size-control); }
+.guide-menu-item small { color: var(--text-tertiary); font-size: var(--font-size-caption); }
+.guide-menu-item > svg { grid-column: 3; grid-row: 1 / 3; color: var(--text-tertiary); }
+.guide-shortcuts { width: min(720px, 100%); }
+.shortcut-groups { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 22px; }
+.shortcut-groups section { min-width: 0; padding-left: 15px; border-left: 1px solid var(--line); }
+.shortcut-groups section:first-child { padding-left: 0; border-left: 0; }
+.shortcut-groups h3 { margin: 0 0 11px; font-size: var(--font-size-control); }
+.shortcut-row { display: grid; grid-template-columns: 67px minmax(0, 1fr); align-items: center; gap: 8px; min-height: 34px; color: var(--text-secondary); font-size: var(--font-size-label); }
+.shortcut-keys { display: flex; align-items: center; gap: 3px; }
+.guide-key-note { display: flex; align-items: center; gap: 7px; margin-top: 19px; padding: 10px; color: var(--text-secondary); background: var(--panel); border-radius: var(--control-radius); font-size: var(--font-size-label); }
+.guide-key-note svg { flex: 0 0 auto; color: var(--accent); }
+
 @media (max-width: 1050px) {
   .workspace { grid-template-columns: 250px minmax(0, 1fr); }
   .keyboard-hint { display: none; }
@@ -474,6 +566,8 @@ kbd { min-width: 18px; height: 20px; display: inline-grid; place-items: center; 
   .app-shell { height: auto; overflow: visible; }
   .titlebar { grid-template-columns: 1fr auto; }
   .titlebar-path { display: none; }
+  .titlebar-actions .button:first-child { width: 34px; padding: 0; font-size: 0; }
+  .titlebar-actions .button:first-child svg { width: 17px; height: 17px; }
   .workspace { display: block; }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
   .group-list-section { display: none; }
@@ -493,6 +587,12 @@ kbd { min-width: 18px; height: 20px; display: inline-grid; place-items: center; 
   .review-actions .button-danger { flex: 1 1 100%; }
   .workflow-notes { grid-template-columns: 1fr; margin-top: 30px; }
   .skeleton-comparison { grid-template-columns: 1fr; }
+  .guide-overlay { align-items: end; padding: 10px; }
+  .guide-dialog { width: 100%; max-height: calc(100dvh - 20px); padding: 22px; overflow-y: auto; }
+  .guide-popover { left: 10px !important; right: 10px !important; top: auto !important; bottom: 10px !important; width: auto; }
+  .shortcut-groups { grid-template-columns: 1fr; gap: 14px; }
+  .shortcut-groups section { padding: 13px 0 0; border-left: 0; border-top: 1px solid var(--line); }
+  .shortcut-groups section:first-child { padding-top: 0; border-top: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

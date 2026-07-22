@@ -28,7 +28,7 @@ def validate_trash_selection(
 
     unknown = selected - known.keys()
     if unknown:
-        raise ValueError("현재 스캔 결과에 없는 사진이 포함되어 있습니다.")
+        raise ValueError("현재 분석 결과에 없는 사진이 포함되어 있습니다.")
 
     paths: list[Path] = []
     for image_id in selected:

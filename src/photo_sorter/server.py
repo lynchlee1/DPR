@@ -109,13 +109,13 @@ def _get_session(scan_id: str) -> ScanSession:
     with sessions_lock:
         session = sessions.get(scan_id)
     if session is None:
-        raise HTTPException(status_code=404, detail="스캔을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="분석 결과를 찾을 수 없습니다.")
     return session
 
 
 def _image_path(session: ScanSession, image_id: str) -> Path:
     if not session.result:
-        raise HTTPException(status_code=409, detail="스캔이 아직 완료되지 않았습니다.")
+        raise HTTPException(status_code=409, detail="사진 분석이 아직 완료되지 않았습니다.")
     for group in session.result["groups"]:
         for image in group["images"]:
             if image["id"] == image_id:
@@ -211,7 +211,7 @@ def get_image(
 def trash_marked(scan_id: str, request: TrashRequest) -> dict:
     session = _get_session(scan_id)
     if not session.result:
-        raise HTTPException(status_code=409, detail="스캔이 아직 완료되지 않았습니다.")
+        raise HTTPException(status_code=409, detail="사진 분석이 아직 완료되지 않았습니다.")
     try:
         outcome = move_selection_to_trash(
             session.result,

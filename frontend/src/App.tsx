@@ -11,6 +11,7 @@ import {
   Keyboard,
   Lightning,
   MagnifyingGlass,
+  Question,
   ShieldCheck,
   Sparkle,
   Trash,
@@ -18,11 +19,14 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { GuideOverlay, type GuideState } from "./GuideOverlay";
 
 type ScanStatus = "queued" | "running" | "complete" | "error";
 type AnalysisMode = "standard" | "quick";
 
 const DEFAULT_QUICK_THRESHOLD = 96;
+const SETUP_GUIDE_KEY = "photo-sorter-setup-guide-v1";
+const REVIEW_GUIDE_KEY = "photo-sorter-review-guide-v1";
 
 type Photo = {
   id: string;
@@ -239,6 +243,10 @@ export function App() {
   const [isTrashing, setIsTrashing] = useState(false);
   const [cleanupOutcome, setCleanupOutcome] = useState<CleanupOutcome | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [guide, setGuide] = useState<GuideState | null>(() =>
+    localStorage.getItem(SETUP_GUIDE_KEY) ? null : { kind: "setup", step: 0 },
+  );
+  const helpButtonRef = useRef<HTMLButtonElement>(null);
 
   const isScanning = session?.status === "queued" || session?.status === "running";
   const currentGroup = result?.groups[selectedGroupIndex] ?? null;
@@ -279,9 +287,9 @@ export function App() {
           setSelectedGroupIndex(0);
           setSelectedPhotoId(firstReviewPhoto(initialResult.groups[0])?.id ?? null);
         }
-        if (next.status === "error") setError(next.error || "스캔 중 오류가 발생했습니다.");
+        if (next.status === "error") setError(next.error || "사진을 분석하는 중 오류가 발생했습니다.");
       } catch (pollError) {
-        setError(pollError instanceof Error ? pollError.message : "스캔 상태를 확인하지 못했습니다.");
+        setError(pollError instanceof Error ? pollError.message : "분석 상태를 확인하지 못했습니다.");
       }
     }, 350);
     return () => window.clearInterval(timer);
@@ -307,8 +315,14 @@ export function App() {
   }, [session?.id, session?.mode, result, selectedGroupIndex]);
 
   useEffect(() => {
+    if (!result?.groups.length || guide || localStorage.getItem(REVIEW_GUIDE_KEY)) return;
+    const timer = window.setTimeout(() => setGuide({ kind: "review", step: 0 }), 0);
+    return () => window.clearTimeout(timer);
+  }, [result?.groups.length, guide]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (!result || isTrashDialogOpen) return;
+      if (!result || isTrashDialogOpen || guide) return;
       if (event.repeat) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
@@ -381,7 +395,7 @@ export function App() {
       });
       setSession(next);
     } catch (scanError) {
-      setError(scanError instanceof Error ? scanError.message : "스캔을 시작하지 못했습니다.");
+      setError(scanError instanceof Error ? scanError.message : "사진 분석을 시작하지 못했습니다.");
     }
   }
 
@@ -435,6 +449,20 @@ export function App() {
   function openTrashDialog(throughGroupIndex: number | null) {
     setTrashThroughGroupIndex(throughGroupIndex);
     setIsTrashDialogOpen(true);
+  }
+
+  function closeGuide() {
+    if (guide?.kind === "setup") localStorage.setItem(SETUP_GUIDE_KEY, "complete");
+    if (guide?.kind === "review") localStorage.setItem(REVIEW_GUIDE_KEY, "complete");
+    setGuide(null);
+    window.setTimeout(() => helpButtonRef.current?.focus(), 0);
+  }
+
+  function changeGuide(nextGuide: GuideState) {
+    if (guide?.kind === "review" && nextGuide.kind === "shortcuts") {
+      localStorage.setItem(REVIEW_GUIDE_KEY, "complete");
+    }
+    setGuide(nextGuide);
   }
 
   async function trashMarked() {
@@ -504,10 +532,15 @@ export function App() {
           <FolderOpen size={15} />
           <span>{shortPath(folder)}</span>
         </div>
-        <button className="button button-secondary compact" onClick={pickFolder} disabled={isPickingFolder || isScanning}>
-          <FolderOpen size={16} />
-          {isPickingFolder ? "선택 중" : "폴더 선택"}
-        </button>
+        <div className="titlebar-actions">
+          <button ref={helpButtonRef} className="button button-secondary compact" onClick={() => setGuide({ kind: "menu", step: 0 })}>
+            <Question size={16} weight="bold" />사용법
+          </button>
+          <button className="button button-secondary compact" onClick={pickFolder} disabled={isPickingFolder || isScanning}>
+            <FolderOpen size={16} />
+            {isPickingFolder ? "선택 중" : "폴더 선택"}
+          </button>
+        </div>
       </header>
 
       {error && (
@@ -536,12 +569,12 @@ export function App() {
             <div className="panel-heading">
               <div>
                 <h2>비교 설정</h2>
-                <p>선택한 폴더와 모든 하위 폴더를 봅니다.</p>
+                <p>선택한 폴더 안의 사진을 함께 확인합니다.</p>
               </div>
             </div>
 
             <span className="field-label" id="analysis-mode-label">분석 방식</span>
-            <div className="mode-selector" role="radiogroup" aria-labelledby="analysis-mode-label">
+            <div className="mode-selector" role="radiogroup" aria-labelledby="analysis-mode-label" data-guide="mode">
               <button
                 className={analysisMode === "standard" ? "selected" : ""}
                 role="radio"
@@ -563,12 +596,12 @@ export function App() {
             </div>
             <p className="mode-help">
               {analysisMode === "quick"
-                ? "선택한 기준을 넘는 사진에서 마지막 촬영 1장을 자동 보존합니다."
-                : "유사도 기준을 직접 정하고 모든 판단을 검토 중에 내립니다."}
+                ? "보관할 사진을 추천하고 나머지는 삭제 후보로 준비합니다."
+                : "비슷한 사진을 모아 보여 주며, 보관 여부는 직접 선택합니다."}
             </p>
 
             <label className="field-label" htmlFor="folder-path">사진 폴더</label>
-            <div className="path-input-row">
+            <div className="path-input-row" data-guide="folder">
               <input
                 id="folder-path"
                 value={folder}
@@ -581,7 +614,7 @@ export function App() {
               </button>
             </div>
 
-            <div className="setting-block">
+            <div className="setting-block" data-guide="threshold">
               <div className="setting-row">
                 <label htmlFor="similarity">유사도 기준</label>
                 <output htmlFor="similarity">{activeThreshold}% 이상</output>
@@ -608,19 +641,19 @@ export function App() {
                 {analysisMode === "quick" ? <Lightning size={16} weight="fill" /> : <MagnifyingGlass size={16} />}
               </div>
               <div>
-                <strong>{analysisMode === "quick" ? `${quickThreshold}% 기준 · 마지막 촬영 보존` : "하위 폴더 포함 · 인접 1분"}</strong>
-                <span>{analysisMode === "quick" ? "앞선 사진은 삭제 후보로 미리 지정" : "모든 사진을 시간순으로 모아 비교"}</span>
+                <strong>{analysisMode === "quick" ? `${quickThreshold}% 기준 · 빠른 추천` : "하위 폴더까지 한 번에"}</strong>
+                <span>{analysisMode === "quick" ? "보관할 사진과 삭제 후보를 미리 구분" : "비슷한 사진을 모아 한눈에 비교"}</span>
               </div>
             </div>
 
-            <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim()}>
+            <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim()} data-guide="scan">
               {analysisMode === "quick" ? <Lightning size={17} weight="fill" /> : <Sparkle size={17} weight="fill" />}
               {isScanning ? "분석 중" : analysisMode === "quick" ? "빠른 분석 시작" : result ? "다시 분석" : "사진 분석"}
             </button>
           </section>
 
           {result && result.groups.length > 0 && session && (
-            <section className="group-list-section" aria-label="유사 사진 그룹">
+            <section className="group-list-section" aria-label="유사 사진 그룹" data-guide="groups">
               <div className="group-list-heading">
                 <h2>{session.mode === "quick" ? "빠른 검토 그룹" : "유사 사진 그룹"}</h2>
                 <span>{result.groups.length}</span>
@@ -695,6 +728,15 @@ export function App() {
           onConfirm={trashMarked}
         />
       )}
+
+      {guide && (
+        <GuideOverlay
+          guide={guide}
+          hasReview={Boolean(result && result.groups.length > 0)}
+          onChange={changeGuide}
+          onClose={closeGuide}
+        />
+      )}
     </div>
   );
 }
@@ -715,8 +757,8 @@ function WelcomeView({
   return (
     <div className="welcome-view">
       <div className="welcome-icon">{mode === "quick" ? <Lightning size={38} weight="duotone" /> : <ImageSquare size={38} weight="duotone" />}</div>
-      <h1>{mode === "quick" ? "확실한 중복부터 빠르게 검토하세요" : "비슷한 사진을 안전하게 정리하세요"}</h1>
-      <p>{mode === "quick" ? `${threshold}% 이상 일치하는 사진을 모아 마지막 촬영본은 보존하고 나머지는 삭제 후보로 준비합니다. 실제 삭제 전에는 모든 그룹을 확인할 수 있습니다.` : "선택한 폴더의 모든 하위 사진 폴더를 탐색하고, 촬영 시간순으로 정렬한 뒤 1분 이내의 인접 사진만 비교합니다. 모든 처리는 이 Mac에서 끝납니다."}</p>
+      <h1>{mode === "quick" ? "매우 비슷한 사진부터 빠르게 검토하세요" : "비슷한 사진을 안전하게 정리하세요"}</h1>
+      <p>{mode === "quick" ? `${threshold}% 이상 비슷한 사진을 모아 보관할 사진을 추천하고, 나머지는 삭제 후보로 준비합니다. 휴지통으로 옮기기 전에 선택을 직접 확인할 수 있습니다.` : "선택한 폴더 안에서 비슷한 사진을 찾아 한눈에 비교할 수 있도록 모아 보여줍니다. 사진은 외부로 전송되지 않으며, 삭제 후보는 직접 선택합니다."}</p>
       <div className="welcome-actions">
         <button className="button button-secondary" onClick={onChoose}><FolderOpen size={17} />다른 폴더 선택</button>
         <button className="button button-primary" onClick={onScan} disabled={!folder}>
@@ -725,9 +767,9 @@ function WelcomeView({
         </button>
       </div>
       <div className="workflow-notes">
-        <div><span>1</span><strong>하위 폴더 탐색</strong><small>사진을 재귀적으로 수집</small></div>
-        <div><span>2</span><strong>인접 비교</strong><small>1분 이내 사진만</small></div>
-        <div><span>3</span><strong>검토 후 정리</strong><small>시스템 휴지통 사용</small></div>
+        <div><span>1</span><strong>사진 찾기</strong><small>하위 폴더까지 포함</small></div>
+        <div><span>2</span><strong>유사 사진 모으기</strong><small>한눈에 비교</small></div>
+        <div><span>3</span><strong>확인 후 정리</strong><small>휴지통으로 이동</small></div>
       </div>
     </div>
   );
@@ -736,8 +778,8 @@ function WelcomeView({
 function ScanningView({ session }: { session: Session }) {
   const progress = session.total ? Math.round((session.completed / session.total) * 100) : 0;
   const phaseLabel = session.phase === "comparing"
-    ? session.mode === "quick" ? "확실한 중복 사진 비교 중" : "인접 사진 비교 중"
-    : "사진 정보와 지문 분석 중";
+    ? session.mode === "quick" ? "매우 비슷한 사진을 찾는 중" : "비슷한 사진을 찾는 중"
+    : "사진을 살펴보는 중";
   return (
     <div className="scanning-view" aria-live="polite">
       <div className="scan-status-row">
@@ -751,7 +793,7 @@ function ScanningView({ session }: { session: Session }) {
         <div className="skeleton-card"><span /><small /></div>
         <div className="skeleton-card"><span /><small /></div>
       </div>
-      <div className="local-note"><ShieldCheck size={17} />사진은 업로드되지 않습니다. 분석 결과도 현재 실행 중에만 보관합니다.</div>
+      <div className="local-note"><ShieldCheck size={17} />사진과 분석 결과는 외부로 전송되지 않습니다.</div>
     </div>
   );
 }
@@ -761,7 +803,7 @@ function EmptyResults({ result, onRescan }: { result: ScanResult; onRescan: () =
     <div className="welcome-view">
       <div className="welcome-icon success"><CheckCircle size={40} weight="duotone" /></div>
       <h1>정리할 유사 사진이 없습니다</h1>
-      <p>{result.stats.source_folders.toLocaleString()}개 폴더의 사진 {result.stats.analyzed.toLocaleString()}장을 분석했지만 현재 {result.threshold}% 기준을 넘는 인접 사진을 찾지 못했습니다.</p>
+      <p>{result.stats.source_folders.toLocaleString()}개 폴더의 사진 {result.stats.analyzed.toLocaleString()}장을 확인했지만 현재 {result.threshold}% 기준에 맞는 유사 사진을 찾지 못했습니다.</p>
       <button className="button button-secondary" onClick={onRescan}>설정을 바꿔 다시 분석</button>
     </div>
   );
@@ -774,7 +816,7 @@ function CompletionView({ outcome, onStartOver }: { outcome: CleanupOutcome; onS
         {outcome.failures.length ? <WarningCircle size={40} weight="duotone" /> : <CheckCircle size={40} weight="duotone" />}
       </div>
       <h1>{outcome.moved.length.toLocaleString()}장을 휴지통으로 옮겼습니다</h1>
-      <p>{outcome.failures.length ? `${outcome.failures.length}장은 옮기지 못했습니다. 원본 파일 권한을 확인해 주세요.` : "필요하면 Finder의 휴지통에서 원래 위치로 복원할 수 있습니다."}</p>
+      <p>{outcome.failures.length ? `${outcome.failures.length}장은 옮기지 못해 원래 위치에 남아 있습니다.` : "필요하면 휴지통에서 원래 위치로 복원할 수 있습니다."}</p>
       <button className="button button-primary" onClick={onStartOver}>새 폴더 정리</button>
     </div>
   );
@@ -810,7 +852,7 @@ function ReviewWorkspace(props: ReviewProps) {
   const keepsAutomaticQuickChoice = groupKeptCount === 1 && group.images.some((image) => image.id === group.keep_id && !image.marked);
   return (
     <div className="review-workspace">
-      <div className="review-toolbar">
+      <div className="review-toolbar" data-guide="review-toolbar">
         <div className="review-summary">
           <strong>그룹 {groupIndex + 1}</strong>
           <span>{result.groups.length}개 중</span>
@@ -821,7 +863,7 @@ function ReviewWorkspace(props: ReviewProps) {
         {props.mode === "quick" && (
           <div className="quick-review-plan" aria-label={`이 그룹에서 ${groupMarkedCount}장 삭제 후보, ${groupKeptCount}장 보존`}>
             <span className="quick-delete"><Trash size={13} weight="fill" />삭제 후보 {groupMarkedCount}</span>
-            <span className="quick-keep"><Check size={13} weight="bold" />보존 {groupKeptCount}장 ({keepsAutomaticQuickChoice ? "마지막 촬영 우선" : "직접 선택"})</span>
+            <span className="quick-keep"><Check size={13} weight="bold" />보존 {groupKeptCount}장 ({keepsAutomaticQuickChoice ? "추천" : "직접 선택"})</span>
           </div>
         )}
         <div className="group-navigation">
@@ -832,6 +874,7 @@ function ReviewWorkspace(props: ReviewProps) {
 
       <div
         className="swipe-gallery"
+        data-guide="swipe"
         style={{ "--gallery-columns": visibleColumns } as CSSProperties}
         aria-label={`그룹 ${groupIndex + 1} 사진 ${group.images.length}장`}
       >
@@ -842,7 +885,7 @@ function ReviewWorkspace(props: ReviewProps) {
             photo={image}
             selected={image.id === selectedPhoto.id}
             shortcutNumber={index < 9 ? index + 1 : null}
-            keepLabel={props.mode === "quick" ? image.id === group.keep_id ? "마지막 촬영 보존" : "보존" : "보관"}
+            keepLabel={props.mode === "quick" ? image.id === group.keep_id ? "추천 보존" : "보존" : "보관"}
             onSelect={() => props.onSelectPhoto(image.id)}
             onSave={() => props.onSwipeDecision(image.id, false)}
             onDelete={() => props.onSwipeDecision(image.id, true)}
@@ -850,7 +893,7 @@ function ReviewWorkspace(props: ReviewProps) {
         ))}
       </div>
 
-      <div className="filmstrip-section">
+      <div className="filmstrip-section" data-guide="filmstrip">
         <div className="filmstrip-heading">
           <span>이 그룹의 사진</span>
           <div className="group-tools">
@@ -874,7 +917,7 @@ function ReviewWorkspace(props: ReviewProps) {
         </div>
       </div>
 
-      <div className="actionbar">
+      <div className="actionbar" data-guide="cleanup">
         <div className="keyboard-hint">
           <Keyboard size={16} />
           {props.mode === "quick" && <span><kbd>←</kbd><kbd>→</kbd> 그룹 이동</span>}
@@ -898,7 +941,7 @@ function ReviewWorkspace(props: ReviewProps) {
             disabled={(props.mode === "quick" ? props.throughCurrentMarkedCount : props.markedCount) === 0}
           >
             <Trash size={16} weight="fill" />
-            {props.mode === "quick" ? "여기까지 정리하기" : `후보 ${props.markedCount.toLocaleString()}건 삭제`}
+            {props.mode === "quick" ? "여기까지 정리하기" : `후보 ${props.markedCount.toLocaleString()}건 이동`}
             <span>{formatBytes(props.mode === "quick" ? props.throughCurrentMarkedBytes : props.markedBytes)}</span>
           </button>
         </div>
@@ -1105,7 +1148,7 @@ function TrashDialog({
         <h2 id="trash-title">{count.toLocaleString()}장을 휴지통으로 옮길까요?</h2>
         <p>
           {partial ? "현재 그룹까지 검토한 삭제 후보만 이동합니다. 뒤쪽의 미검토 그룹은 그대로 남습니다. " : ""}
-          약 {formatBytes(bytes)}의 공간을 확보할 수 있습니다. 파일은 Finder의 휴지통에서 복원할 수 있습니다.
+          선택한 사진의 전체 용량은 약 {formatBytes(bytes)}입니다. 파일은 휴지통에서 복원할 수 있습니다.
         </p>
         {fullyMarkedGroupCount > 0 ? (
           <div className="safety-note destructive"><WarningCircle size={17} weight="fill" />{fullyMarkedGroupCount}개 그룹은 사진이 한 장도 남지 않습니다.</div>
