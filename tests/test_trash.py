@@ -73,3 +73,18 @@ def test_move_can_explicitly_trash_every_image_in_a_group(tmp_path: Path) -> Non
 
     assert outcome["failures"] == []
     assert moved == [str(tmp_path / "first.jpg"), str(tmp_path / "second.jpg")]
+
+
+def test_nested_photo_is_a_valid_trash_target(tmp_path: Path) -> None:
+    nested = tmp_path / "album" / "day-one"
+    nested.mkdir(parents=True)
+    nested_photo = nested / "second.jpg"
+    nested_photo.write_bytes(b"nested")
+    result = make_result(tmp_path)
+    result["groups"][0]["images"][1]["path"] = str(nested_photo)
+    moved: list[str] = []
+
+    outcome = move_selection_to_trash(result, ["second"], mover=moved.append)
+
+    assert outcome == {"moved": [str(nested_photo)], "failures": []}
+    assert moved == [str(nested_photo)]

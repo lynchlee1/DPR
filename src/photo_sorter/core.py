@@ -340,6 +340,7 @@ def scan_folder(
 
     for number, members in enumerate(raw_groups, start=1):
         members.sort(key=lambda record: (record.captured_at, record.path.name.casefold()))
+        folder_count = len({member.path.parent for member in members})
         member_ids = {member.id for member in members}
         relevant_pairs = [
             pair
@@ -375,6 +376,7 @@ def scan_folder(
             serialized_images.append(
                 _serialize_record(
                     member,
+                    folder,
                     score_to_keeper,
                     member.id != reference_id and score_to_keeper >= threshold,
                     similarity_matrix[member.id],
@@ -388,6 +390,7 @@ def scan_folder(
                 "keep_ids": sorted({image["reference_id"] for image in serialized_images}),
                 "images": serialized_images,
                 "member_count": len(members),
+                "folder_count": folder_count,
                 "max_similarity": max(pair.similarity for pair in relevant_pairs),
                 "min_similarity": min(pair.similarity for pair in relevant_pairs),
                 "time_start": members[0].captured_at.isoformat(),
@@ -406,6 +409,7 @@ def scan_folder(
         "failures": failures,
         "stats": {
             "found": len(paths),
+            "source_folders": len({path.parent for path in paths}),
             "analyzed": len(records),
             "pairs_compared": len(pairs_in_window),
             "matched_pairs": len(matching_pairs),
@@ -419,6 +423,7 @@ def scan_folder(
 
 def _serialize_record(
     record: ImageRecord,
+    root: Path,
     score_to_keeper: float,
     marked: bool,
     similarity_by_id: dict[str, float],
@@ -428,6 +433,7 @@ def _serialize_record(
         "id": record.id,
         "name": record.path.name,
         "path": str(record.path),
+        "relative_path": record.path.relative_to(root).as_posix(),
         "captured_at": record.captured_at.isoformat(),
         "time_source": record.time_source,
         "width": record.width,

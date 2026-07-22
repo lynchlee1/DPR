@@ -5,7 +5,7 @@ import os
 import numpy as np
 from PIL import Image, ImageDraw
 
-from photo_sorter.core import analyze_image, capture_time, scan_folder, similarity
+from photo_sorter.core import analyze_image, capture_time, discover_images, scan_folder, similarity
 
 
 def save_image(path: Path, color: tuple[int, int, int], exif_time: str | None = None) -> None:
@@ -86,6 +86,32 @@ def test_scan_only_compares_chronological_neighbors_inside_one_minute(tmp_path: 
         "20240101_120050_other.jpg",
     ]
     assert sum(image["marked"] for image in result["groups"][0]["images"]) == 1
+
+
+def test_scan_recurses_through_nested_photo_folders(tmp_path: Path) -> None:
+    first_folder = tmp_path / "2023" / "trip"
+    second_folder = tmp_path / "2024" / "favorites"
+    first_folder.mkdir(parents=True)
+    second_folder.mkdir(parents=True)
+    save_image(first_folder / "20240101_120000_photo.jpg", (26, 93, 142))
+    save_image(second_folder / "20240101_120030_photo.jpg", (26, 93, 142))
+    (tmp_path / "2024" / "notes.txt").write_text("not an image")
+
+    discovered = discover_images(tmp_path)
+    result = scan_folder(tmp_path, threshold=88, time_window_seconds=60, max_workers=2)
+
+    assert discovered == [
+        first_folder / "20240101_120000_photo.jpg",
+        second_folder / "20240101_120030_photo.jpg",
+    ]
+    assert result["stats"]["found"] == 2
+    assert result["stats"]["source_folders"] == 2
+    assert result["stats"]["groups"] == 1
+    assert result["groups"][0]["folder_count"] == 2
+    assert [image["relative_path"] for image in result["groups"][0]["images"]] == [
+        "2023/trip/20240101_120000_photo.jpg",
+        "2024/favorites/20240101_120030_photo.jpg",
+    ]
 
 
 def test_one_minute_chain_forms_one_five_photo_group(tmp_path: Path) -> None:

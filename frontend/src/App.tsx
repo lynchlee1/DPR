@@ -24,6 +24,7 @@ type Photo = {
   id: string;
   name: string;
   path: string;
+  relative_path: string;
   captured_at: string;
   time_source: "exif" | "filename" | "modified";
   width: number;
@@ -42,6 +43,7 @@ type PhotoGroup = {
   keep_ids: string[];
   images: Photo[];
   member_count: number;
+  folder_count: number;
   max_similarity: number;
   min_similarity: number;
   time_start: string;
@@ -56,6 +58,7 @@ type ScanResult = {
   failures: { path: string; reason: string }[];
   stats: {
     found: number;
+    source_folders: number;
     analyzed: number;
     pairs_compared: number;
     matched_pairs: number;
@@ -174,6 +177,7 @@ function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult
       keep_ids: keepIds,
       images,
       member_count: images.length,
+      folder_count: new Set(images.map((image) => image.relative_path.split("/").slice(0, -1).join("/"))).size,
       time_start: images[0].captured_at,
       time_end: images[images.length - 1].captured_at,
     }];
@@ -422,7 +426,7 @@ export function App() {
             <div className="panel-heading">
               <div>
                 <h2>비교 설정</h2>
-                <p>촬영 시간이 가까운 사진만 봅니다.</p>
+                <p>선택한 폴더와 모든 하위 폴더를 봅니다.</p>
               </div>
             </div>
 
@@ -460,7 +464,7 @@ export function App() {
 
             <div className="fixed-setting">
               <div className="fixed-setting-icon"><MagnifyingGlass size={16} /></div>
-              <div><strong>인접 시간 1분</strong><span>시간순으로 바로 이웃한 사진 비교</span></div>
+              <div><strong>하위 폴더 포함 · 인접 1분</strong><span>모든 사진을 시간순으로 모아 비교</span></div>
             </div>
 
             <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim()}>
@@ -489,7 +493,7 @@ export function App() {
                     </span>
                     <span className="group-copy">
                       <strong>그룹 {index + 1}</strong>
-                      <small>{group.member_count}장, 최대 {group.max_similarity}%</small>
+                      <small>{group.member_count}장 · {group.folder_count}개 폴더 · 최대 {group.max_similarity}%</small>
                     </span>
                     <span className="group-count">{group.images.filter((image) => image.marked).length}</span>
                   </button>
@@ -549,13 +553,13 @@ function WelcomeView({ onChoose, onScan, folder }: { onChoose: () => void; onSca
     <div className="welcome-view">
       <div className="welcome-icon"><ImageSquare size={38} weight="duotone" /></div>
       <h1>비슷한 사진을 안전하게 정리하세요</h1>
-      <p>촬영 시간순으로 정렬한 뒤 1분 이내의 인접 사진만 비교합니다. 모든 처리는 이 Mac에서 끝납니다.</p>
+      <p>선택한 폴더의 모든 하위 사진 폴더를 탐색하고, 촬영 시간순으로 정렬한 뒤 1분 이내의 인접 사진만 비교합니다. 모든 처리는 이 Mac에서 끝납니다.</p>
       <div className="welcome-actions">
         <button className="button button-secondary" onClick={onChoose}><FolderOpen size={17} />다른 폴더 선택</button>
         <button className="button button-primary" onClick={onScan} disabled={!folder}><Sparkle size={17} weight="fill" />분석 시작</button>
       </div>
       <div className="workflow-notes">
-        <div><span>1</span><strong>시간 정렬</strong><small>EXIF와 파일명 우선</small></div>
+        <div><span>1</span><strong>하위 폴더 탐색</strong><small>사진을 재귀적으로 수집</small></div>
         <div><span>2</span><strong>인접 비교</strong><small>1분 이내 사진만</small></div>
         <div><span>3</span><strong>검토 후 정리</strong><small>시스템 휴지통 사용</small></div>
       </div>
@@ -589,7 +593,7 @@ function EmptyResults({ result, onRescan }: { result: ScanResult; onRescan: () =
     <div className="welcome-view">
       <div className="welcome-icon success"><CheckCircle size={40} weight="duotone" /></div>
       <h1>정리할 유사 사진이 없습니다</h1>
-      <p>{result.stats.analyzed.toLocaleString()}장을 분석했지만 현재 {result.threshold}% 기준을 넘는 인접 사진을 찾지 못했습니다.</p>
+      <p>{result.stats.source_folders.toLocaleString()}개 폴더의 사진 {result.stats.analyzed.toLocaleString()}장을 분석했지만 현재 {result.threshold}% 기준을 넘는 인접 사진을 찾지 못했습니다.</p>
       <button className="button button-secondary" onClick={onRescan}>설정을 바꿔 다시 분석</button>
     </div>
   );
@@ -637,6 +641,7 @@ function ReviewWorkspace(props: ReviewProps) {
           <span>{result.groups.length}개 중</span>
           <span className="separator" />
           <span>{group.member_count}장</span>
+          <span>{group.folder_count}개 폴더</span>
         </div>
         <div className="group-navigation">
           <button className="icon-button" aria-label="이전 그룹" onClick={props.onPrevious} disabled={groupIndex === 0}><ArrowLeft size={18} /></button>
@@ -676,7 +681,7 @@ function ReviewWorkspace(props: ReviewProps) {
               key={image.id}
               className={`filmstrip-item ${image.id === selectedPhoto.id ? "selected" : ""} ${image.marked ? "marked" : "kept"}`}
               onClick={() => props.onSelectPhoto(image.id)}
-              aria-label={`${image.name}, ${image.marked ? "삭제 후보" : "보관"}`}
+              aria-label={`${image.relative_path}, ${image.marked ? "삭제 후보" : "보관"}`}
             >
               <img src={imageUrl(props.scanId, image.id, "thumb")} alt="" loading="lazy" decoding="async" />
               <span>{image.marked ? <WarningCircle size={12} weight="fill" /> : <Check size={12} weight="bold" />}</span>
@@ -831,7 +836,7 @@ function SwipePhotoViewer({
         onPointerUp={finishSwipe}
         onPointerCancel={(event) => finishSwipe(event, true)}
         onDragStart={(event) => event.preventDefault()}
-        aria-label={`${photo.name}. 위로 밀면 보관, 아래로 밀면 삭제 후보`}
+        aria-label={`${photo.relative_path}. 위로 밀면 보관, 아래로 밀면 삭제 후보`}
       >
         <PhotoViewer scanId={scanId} photo={photo} label={photo.marked ? "삭제 후보" : "보관"} tone={photo.marked ? "delete" : "keep"} />
         <div className="swipe-guide" aria-hidden="true">
@@ -849,7 +854,7 @@ function PhotoViewer({ scanId, photo, label, tone }: { scanId: string; photo: Ph
     <article className={`photo-viewer ${tone}`}>
       <div className="photo-viewer-header">
         <span className="status-label">{tone === "keep" ? <Check size={13} weight="bold" /> : <Trash size={13} weight="fill" />}{label}</span>
-        <strong title={photo.name}>{photo.name}</strong>
+        <strong title={photo.relative_path}>{photo.name}</strong>
       </div>
       <div className="photo-stage"><img src={imageUrl(scanId, photo.id)} alt={photo.name} draggable={false} loading="lazy" decoding="async" /></div>
       <dl className="photo-meta">
@@ -857,7 +862,7 @@ function PhotoViewer({ scanId, photo, label, tone }: { scanId: string; photo: Ph
         <div><dt>크기</dt><dd>{photo.width.toLocaleString()} × {photo.height.toLocaleString()}</dd></div>
         <div><dt>파일</dt><dd>{formatBytes(photo.size_bytes)}</dd></div>
       </dl>
-      <div className="photo-path" title={photo.path}><Info size={13} />{shortPath(photo.path)}</div>
+      <div className="photo-path" title={photo.path}><Info size={13} />{photo.relative_path}</div>
     </article>
   );
 }
