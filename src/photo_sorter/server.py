@@ -32,6 +32,7 @@ class ScanRequest(BaseModel):
     threshold: float = Field(default=88, ge=0, le=100)
     time_window_seconds: int = Field(default=60, ge=1, le=3600)
     mode: Literal["standard", "quick"] = "standard"
+    include_subfolders: bool = True
 
 
 class TrashRequest(BaseModel):
@@ -46,6 +47,7 @@ class ScanSession:
     threshold: float
     time_window_seconds: int
     mode: Literal["standard", "quick"] = "standard"
+    include_subfolders: bool = True
     status: str = "queued"
     phase: str = "queued"
     completed: int = 0
@@ -61,6 +63,7 @@ class ScanSession:
             "threshold": self.threshold,
             "time_window_seconds": self.time_window_seconds,
             "mode": self.mode,
+            "include_subfolders": self.include_subfolders,
             "status": self.status,
             "phase": self.phase,
             "completed": self.completed,
@@ -92,6 +95,7 @@ def _run_scan(session: ScanSession) -> None:
             time_window_seconds=session.time_window_seconds,
             on_progress=lambda completed, total, phase: _update_progress(session, completed, total, phase),
             keeper_strategy="latest" if session.mode == "quick" else "quality",
+            include_subfolders=session.include_subfolders,
         )
         with sessions_lock:
             session.result = result
@@ -180,6 +184,7 @@ def create_scan(request: ScanRequest) -> dict:
         threshold=request.threshold,
         time_window_seconds=request.time_window_seconds,
         mode=request.mode,
+        include_subfolders=request.include_subfolders,
     )
     with sessions_lock:
         sessions[session.id] = session

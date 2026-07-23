@@ -131,6 +131,35 @@ def test_scan_recurses_through_nested_photo_folders(tmp_path: Path) -> None:
     ]
 
 
+def test_scan_can_exclude_nested_photo_folders(tmp_path: Path) -> None:
+    nested_folder = tmp_path / "nested"
+    nested_folder.mkdir()
+    save_image(tmp_path / "20240101_120000_root.jpg", (26, 93, 142))
+    save_image(tmp_path / "20240101_120030_root.jpg", (26, 93, 142))
+    save_image(nested_folder / "20240101_120010_nested.jpg", (26, 93, 142))
+
+    discovered = discover_images(tmp_path, include_subfolders=False)
+    result = scan_folder(
+        tmp_path,
+        threshold=88,
+        time_window_seconds=60,
+        max_workers=2,
+        include_subfolders=False,
+    )
+
+    assert discovered == [
+        tmp_path / "20240101_120000_root.jpg",
+        tmp_path / "20240101_120030_root.jpg",
+    ]
+    assert result["include_subfolders"] is False
+    assert result["stats"]["found"] == 2
+    assert result["stats"]["source_folders"] == 1
+    assert [image["relative_path"] for image in result["groups"][0]["images"]] == [
+        "20240101_120000_root.jpg",
+        "20240101_120030_root.jpg",
+    ]
+
+
 def test_one_minute_chain_forms_one_five_photo_group(tmp_path: Path) -> None:
     for index, second in enumerate((0, 60, 120, 180, 240)):
         minute, remaining_second = divmod(second, 60)

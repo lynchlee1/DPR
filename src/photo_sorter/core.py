@@ -46,11 +46,12 @@ class SimilarityPair:
     similarity: float
 
 
-def discover_images(folder: Path) -> list[Path]:
+def discover_images(folder: Path, include_subfolders: bool = True) -> list[Path]:
+    candidates = folder.rglob("*") if include_subfolders else folder.iterdir()
     return sorted(
         (
             path
-            for path in folder.rglob("*")
+            for path in candidates
             if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
         ),
         key=lambda path: str(path).casefold(),
@@ -257,6 +258,7 @@ def scan_folder(
     on_progress: ProgressCallback | None = None,
     max_workers: int | None = None,
     keeper_strategy: Literal["quality", "latest"] = "quality",
+    include_subfolders: bool = True,
 ) -> dict:
     started = time.perf_counter()
     folder = folder.expanduser().resolve()
@@ -269,7 +271,7 @@ def scan_folder(
     if keeper_strategy not in {"quality", "latest"}:
         raise ValueError("보존 사진 선택 방식이 올바르지 않습니다.")
 
-    paths = discover_images(folder)
+    paths = discover_images(folder, include_subfolders=include_subfolders)
     if on_progress:
         on_progress(0, len(paths), "analyzing")
 
@@ -385,6 +387,7 @@ def scan_folder(
         "threshold": threshold,
         "time_window_seconds": time_window_seconds,
         "keeper_strategy": keeper_strategy,
+        "include_subfolders": include_subfolders,
         "groups": groups,
         "failures": failures,
         "stats": {

@@ -63,6 +63,7 @@ type ScanResult = {
   threshold: number;
   time_window_seconds: number;
   keeper_strategy: "quality" | "latest";
+  include_subfolders: boolean;
   groups: PhotoGroup[];
   failures: { path: string; reason: string }[];
   stats: {
@@ -84,6 +85,7 @@ type Session = {
   threshold: number;
   time_window_seconds: number;
   mode: AnalysisMode;
+  include_subfolders: boolean;
   status: ScanStatus;
   phase: "queued" | "analyzing" | "comparing" | "complete" | "error";
   completed: number;
@@ -233,6 +235,9 @@ export function App() {
   const [threshold, setThreshold] = useState(88);
   const [quickThreshold, setQuickThreshold] = useState(DEFAULT_QUICK_THRESHOLD);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("standard");
+  const [includeSubfolders, setIncludeSubfolders] = useState(
+    () => localStorage.getItem("photo-sorter-include-subfolders") !== "false",
+  );
   const [session, setSession] = useState<Session | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
   const [selectedGroupIndex, setSelectedGroupIndex] = useState(0);
@@ -391,7 +396,13 @@ export function App() {
       localStorage.setItem("photo-sorter-folder", folder);
       const next = await api<Session>("/api/scans", {
         method: "POST",
-        body: JSON.stringify({ folder, threshold: activeThreshold, time_window_seconds: 60, mode: analysisMode }),
+        body: JSON.stringify({
+          folder,
+          threshold: activeThreshold,
+          time_window_seconds: 60,
+          mode: analysisMode,
+          include_subfolders: includeSubfolders,
+        }),
       });
       setSession(next);
     } catch (scanError) {
@@ -610,6 +621,41 @@ export function App() {
               </button>
             </div>
 
+            <div className="subfolder-setting">
+              <div>
+                <strong id="subfolder-label">하위 폴더 탐색</strong>
+                <span>{includeSubfolders ? "중첩된 모든 폴더의 사진 포함" : "선택한 폴더의 사진만 포함"}</span>
+              </div>
+              <div className="binary-selector" role="radiogroup" aria-labelledby="subfolder-label">
+                <button
+                  className={includeSubfolders ? "selected" : ""}
+                  role="radio"
+                  aria-checked={includeSubfolders}
+                  aria-label="하위 폴더 탐색 O"
+                  onClick={() => {
+                    setIncludeSubfolders(true);
+                    localStorage.setItem("photo-sorter-include-subfolders", "true");
+                  }}
+                  disabled={isScanning}
+                >
+                  O
+                </button>
+                <button
+                  className={!includeSubfolders ? "selected" : ""}
+                  role="radio"
+                  aria-checked={!includeSubfolders}
+                  aria-label="하위 폴더 탐색 X"
+                  onClick={() => {
+                    setIncludeSubfolders(false);
+                    localStorage.setItem("photo-sorter-include-subfolders", "false");
+                  }}
+                  disabled={isScanning}
+                >
+                  X
+                </button>
+              </div>
+            </div>
+
             <div className="setting-block" data-guide="threshold">
               <div className="setting-row">
                 <label htmlFor="similarity">유사도 기준</label>
@@ -637,7 +683,7 @@ export function App() {
                 {analysisMode === "quick" ? <Lightning size={16} weight="fill" /> : <MagnifyingGlass size={16} />}
               </div>
               <div>
-                <strong>{analysisMode === "quick" ? `${quickThreshold}% 기준 · 빠른 추천` : "하위 폴더까지 한 번에"}</strong>
+                <strong>{analysisMode === "quick" ? `${quickThreshold}% 기준 · 빠른 추천` : "보관 여부를 직접 선택"}</strong>
                 <span>{analysisMode === "quick" ? "보관할 사진과 삭제 후보를 미리 구분" : "비슷한 사진을 모아 한눈에 비교"}</span>
               </div>
             </div>
@@ -708,7 +754,14 @@ export function App() {
               onTrashThrough={() => openTrashDialog(selectedGroupIndex)}
             />
           ) : (
-            <WelcomeView onChoose={pickFolder} onScan={startScan} folder={folder} mode={analysisMode} threshold={activeThreshold} />
+            <WelcomeView
+              onChoose={pickFolder}
+              onScan={startScan}
+              folder={folder}
+              mode={analysisMode}
+              threshold={activeThreshold}
+              includeSubfolders={includeSubfolders}
+            />
           )}
         </main>
       </div>
@@ -743,12 +796,14 @@ function WelcomeView({
   folder,
   mode,
   threshold,
+  includeSubfolders,
 }: {
   onChoose: () => void;
   onScan: () => void;
   folder: string;
   mode: AnalysisMode;
   threshold: number;
+  includeSubfolders: boolean;
 }) {
   return (
     <div className="welcome-view">
@@ -763,7 +818,7 @@ function WelcomeView({
         </button>
       </div>
       <div className="workflow-notes">
-        <div><span>1</span><strong>사진 찾기</strong><small>하위 폴더까지 포함</small></div>
+        <div><span>1</span><strong>사진 찾기</strong><small>{includeSubfolders ? "하위 폴더 포함" : "선택한 폴더만"}</small></div>
         <div><span>2</span><strong>유사 사진 모으기</strong><small>한눈에 비교</small></div>
         <div><span>3</span><strong>확인 후 정리</strong><small>휴지통으로 이동</small></div>
       </div>
