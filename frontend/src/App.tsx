@@ -30,6 +30,7 @@ type DateOrder = "oldest" | "newest";
 const DEFAULT_QUICK_THRESHOLD = 96;
 const SETUP_GUIDE_KEY = "photo-sorter-setup-guide-v1";
 const REVIEW_GUIDE_KEY = "photo-sorter-review-guide-v1";
+const SHOW_SINGLETONS_KEY = "photo-sorter-show-singletons";
 
 type Photo = {
   id: string;
@@ -83,6 +84,8 @@ type ScanResult = {
     pairs_compared: number;
     matched_pairs: number;
     groups: number;
+    similar_groups: number;
+    singletons: number;
     marked_count: number;
     marked_bytes: number;
     duration_seconds: number;
@@ -188,6 +191,10 @@ function firstReviewPhoto(group: PhotoGroup | undefined): Photo | undefined {
   return group?.images.find((image) => image.marked) ?? group?.images[0];
 }
 
+function filterReviewGroups(groups: PhotoGroup[], showSingletons: boolean): PhotoGroup[] {
+  return showSingletons ? groups : groups.filter((group) => group.images.length > 1);
+}
+
 function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult {
   const moved = new Set(movedPaths);
   const groups = result.groups.flatMap((group) => {
@@ -251,6 +258,9 @@ export function App() {
   const [dateOrder, setDateOrder] = useState<DateOrder>(
     () => localStorage.getItem("photo-sorter-date-order") === "newest" ? "newest" : "oldest",
   );
+  const [showSingletons, setShowSingletons] = useState(
+    () => localStorage.getItem(SHOW_SINGLETONS_KEY) !== "false",
+  );
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
@@ -274,26 +284,30 @@ export function App() {
   const helpButtonRef = useRef<HTMLButtonElement>(null);
 
   const isScanning = session?.status === "queued" || session?.status === "running";
-  const currentGroup = result?.groups[selectedGroupIndex] ?? null;
+  const visibleGroups = useMemo(
+    () => filterReviewGroups(result?.groups ?? [], showSingletons),
+    [result, showSingletons],
+  );
+  const currentGroup = visibleGroups[selectedGroupIndex] ?? null;
   const selectedPhoto =
     currentGroup?.images.find((image) => image.id === selectedPhotoId) ??
     firstReviewPhoto(currentGroup ?? undefined) ??
     null;
 
   const markedPhotos = useMemo(
-    () => result?.groups.flatMap((group) => group.images).filter((image) => image.marked) ?? [],
-    [result],
+    () => visibleGroups.flatMap((group) => group.images).filter((image) => image.marked),
+    [visibleGroups],
   );
   const keptPhotos = useMemo(
-    () => result?.groups.flatMap((group) => group.images).filter((image) => !image.marked) ?? [],
-    [result],
+    () => visibleGroups.flatMap((group) => group.images).filter((image) => !image.marked),
+    [visibleGroups],
   );
   const markedBytes = markedPhotos.reduce((total, image) => total + image.size_bytes, 0);
   const keptBytes = keptPhotos.reduce((total, image) => total + image.size_bytes, 0);
-  const groupsInTrashScope = result
+  const groupsInTrashScope = visibleGroups.length
     ? trashThroughGroupIndex === null
-      ? result.groups
-      : result.groups.slice(0, trashThroughGroupIndex + 1)
+      ? visibleGroups
+      : visibleGroups.slice(0, trashThroughGroupIndex + 1)
     : [];
   const pendingTrashPhotos = groupsInTrashScope.flatMap((group) => group.images).filter((image) => image.marked);
   const pendingTrashBytes = pendingTrashPhotos.reduce((total, image) => total + image.size_bytes, 0);
@@ -301,7 +315,7 @@ export function App() {
     (group) => group.images.length > 0 && group.images.every((image) => image.marked),
   ).length;
   const throughCurrentMarkedPhotos =
-    result?.groups.slice(0, selectedGroupIndex + 1).flatMap((group) => group.images).filter((image) => image.marked) ?? [];
+    visibleGroups.slice(0, selectedGroupIndex + 1).flatMap((group) => group.images).filter((image) => image.marked);
   const throughCurrentMarkedBytes = throughCurrentMarkedPhotos.reduce((total, image) => total + image.size_bytes, 0);
   const activeThreshold = analysisMode === "quick" ? quickThreshold : threshold;
   const isDayLimitValid = dayLimit === "" || (/^\d+$/.test(dayLimit) && Number(dayLimit) >= 1);
@@ -309,6 +323,7 @@ export function App() {
     ? "분석 날짜 수를 확인하세요"
     : [
         includeSubfolders ? "하위 폴더 포함" : "현재 폴더만",
+        showSingletons ? "단독 사진 표시" : "단독 사진 숨김",
         dayLimit ? `${dateOrder === "oldest" ? "오래된 날부터" : "최신 날부터"} ${dayLimit}일` : "전체 기간",
         `유사도 ${activeThreshold}%`,
       ].join(", ");
@@ -321,9 +336,10 @@ export function App() {
         setSession(next);
         if (next.status === "complete" && next.result) {
           const initialResult = next.mode === "quick" ? next.result : clearCandidateMarks(next.result);
+          const initialGroups = filterReviewGroups(initialResult.groups, showSingletons);
           setResult(initialResult);
           setSelectedGroupIndex(0);
-          setSelectedPhotoId(firstReviewPhoto(initialResult.groups[0])?.id ?? null);
+          setSelectedPhotoId(firstReviewPhoto(initialGroups[0])?.id ?? null);
         }
         if (next.status === "error") setError(next.error || "사진을 분석하는 중 오류가 발생했습니다.");
       } catch (pollError) {
@@ -331,11 +347,11 @@ export function App() {
       }
     }, 350);
     return () => window.clearInterval(timer);
-  }, [session?.id, session?.status]);
+  }, [session?.id, session?.status, showSingletons]);
 
   useEffect(() => {
     if (!session || session.mode !== "quick" || !result) return;
-    const preloaders = result.groups
+    const preloaders = visibleGroups
       .slice(selectedGroupIndex + 1, selectedGroupIndex + 3)
       .flatMap((group) => group.images)
       .map((image) => {
@@ -350,13 +366,13 @@ export function App() {
         preloader.onerror = null;
       });
     };
-  }, [session?.id, session?.mode, result, selectedGroupIndex]);
+  }, [session?.id, session?.mode, result, selectedGroupIndex, visibleGroups]);
 
   useEffect(() => {
-    if (!result?.groups.length || guide || localStorage.getItem(REVIEW_GUIDE_KEY)) return;
+    if (!visibleGroups.length || guide || localStorage.getItem(REVIEW_GUIDE_KEY)) return;
     const timer = window.setTimeout(() => setGuide({ kind: "review", step: 0 }), 0);
     return () => window.clearTimeout(timer);
-  }, [result?.groups.length, guide]);
+  }, [visibleGroups.length, guide]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -393,7 +409,7 @@ export function App() {
         event.preventDefault();
         selectGroup(
           event.key === "ArrowRight"
-            ? Math.min(selectedGroupIndex + 1, result.groups.length - 1)
+            ? Math.min(selectedGroupIndex + 1, visibleGroups.length - 1)
             : Math.max(selectedGroupIndex - 1, 0),
         );
       }
@@ -498,17 +514,19 @@ export function App() {
   }
 
   function selectGroup(index: number) {
-    if (!result?.groups[index]) return;
+    if (!visibleGroups[index]) return;
     setSelectedGroupIndex(index);
-    setSelectedPhotoId(firstReviewPhoto(result.groups[index])?.id ?? null);
+    setSelectedPhotoId(firstReviewPhoto(visibleGroups[index])?.id ?? null);
   }
 
   function updateCurrentGroup(update: (group: PhotoGroup) => PhotoGroup) {
+    const currentGroupId = currentGroup?.id;
+    if (!currentGroupId) return;
     setResult((previous) => {
       if (!previous) return previous;
       return {
         ...previous,
-        groups: previous.groups.map((group, index) => (index === selectedGroupIndex ? update(group) : group)),
+        groups: previous.groups.map((group) => (group.id === currentGroupId ? update(group) : group)),
       };
     });
   }
@@ -544,6 +562,31 @@ export function App() {
     }));
   }
 
+  function updateSingletonVisibility(show: boolean) {
+    setShowSingletons(show);
+    localStorage.setItem(SHOW_SINGLETONS_KEY, String(show));
+    if (!result) return;
+
+    const nextVisibleGroups = filterReviewGroups(result.groups, show);
+    if (nextVisibleGroups.length === 0) {
+      setSelectedGroupIndex(0);
+      setSelectedPhotoId(null);
+      return;
+    }
+
+    const currentGroupId = currentGroup?.id;
+    const preservedGroupIndex = currentGroupId
+      ? nextVisibleGroups.findIndex((group) => group.id === currentGroupId)
+      : -1;
+    const nextGroupIndex = preservedGroupIndex >= 0
+      ? preservedGroupIndex
+      : Math.min(selectedGroupIndex, nextVisibleGroups.length - 1);
+    const nextGroup = nextVisibleGroups[nextGroupIndex];
+    const preservedPhoto = nextGroup.images.find((image) => image.id === selectedPhotoId);
+    setSelectedGroupIndex(nextGroupIndex);
+    setSelectedPhotoId(preservedPhoto?.id ?? firstReviewPhoto(nextGroup)?.id ?? null);
+  }
+
   function openTrashDialog(throughGroupIndex: number | null) {
     setTrashThroughGroupIndex(throughGroupIndex);
     setIsTrashDialogOpen(true);
@@ -577,14 +620,15 @@ export function App() {
     preferredGroupIndex?: number,
   ) {
     setResult(nextResult);
-    if (nextResult.groups.length === 0) {
+    const nextVisibleGroups = filterReviewGroups(nextResult.groups, showSingletons);
+    if (nextVisibleGroups.length === 0) {
       setSelectedGroupIndex(0);
       setSelectedPhotoId(null);
       return;
     }
 
-    const nextGroupIndex = preferredGroupIndex ?? Math.min(selectedGroupIndex, nextResult.groups.length - 1);
-    const nextGroup = nextResult.groups[nextGroupIndex];
+    const nextGroupIndex = preferredGroupIndex ?? Math.min(selectedGroupIndex, nextVisibleGroups.length - 1);
+    const nextGroup = nextVisibleGroups[nextGroupIndex];
     const preservedSelection = nextGroup.images.find((image) => image.id === preferredPhotoId);
     setSelectedGroupIndex(nextGroupIndex);
     setSelectedPhotoId(preservedSelection?.id ?? firstReviewPhoto(nextGroup)?.id ?? null);
@@ -646,7 +690,7 @@ export function App() {
       });
       setCleanupOutcome(outcome);
       const nextResult = removeMovedPhotos(resultBeforeTrash, outcome.moved);
-      const nextCandidateGroupIndex = nextResult.groups.findIndex(
+      const nextCandidateGroupIndex = filterReviewGroups(nextResult.groups, showSingletons).findIndex(
         (group) => group.images.some((image) => image.marked),
       );
       showRemainingPhotos(
@@ -828,7 +872,7 @@ export function App() {
               </button>
 
               <div className="advanced-settings-content" id="advanced-settings-content" hidden={!isAdvancedOpen}>
-                <div className="subfolder-setting">
+                <div className="binary-setting">
                   <div>
                     <strong id="subfolder-label">하위 폴더 탐색</strong>
                     <span>{includeSubfolders ? "중첩된 모든 폴더의 사진 포함" : "선택한 폴더의 사진만 포함"}</span>
@@ -857,6 +901,33 @@ export function App() {
                         localStorage.setItem("photo-sorter-include-subfolders", "false");
                       }}
                       disabled={isScanning}
+                    >
+                      X
+                    </button>
+                  </div>
+                </div>
+
+                <div className="binary-setting">
+                  <div>
+                    <strong id="singleton-visibility-label">단독 사진 표시</strong>
+                    <span>{showSingletons ? "1장짜리 그룹을 함께 표시" : "유사 사진 그룹만 표시"}</span>
+                  </div>
+                  <div className="binary-selector" role="radiogroup" aria-labelledby="singleton-visibility-label">
+                    <button
+                      className={showSingletons ? "selected" : ""}
+                      role="radio"
+                      aria-checked={showSingletons}
+                      aria-label="단독 사진 표시 O"
+                      onClick={() => updateSingletonVisibility(true)}
+                    >
+                      O
+                    </button>
+                    <button
+                      className={!showSingletons ? "selected" : ""}
+                      role="radio"
+                      aria-checked={!showSingletons}
+                      aria-label="단독 사진 표시 X"
+                      onClick={() => updateSingletonVisibility(false)}
                     >
                       X
                     </button>
@@ -954,14 +1025,14 @@ export function App() {
             </button>
           </section>
 
-          {result && result.groups.length > 0 && session && (
-            <section className="group-list-section" aria-label="유사 사진 그룹" data-guide="groups">
+          {visibleGroups.length > 0 && session && (
+            <section className="group-list-section" aria-label="분석 사진 그룹" data-guide="groups">
               <div className="group-list-heading">
-                <h2>{session.mode === "quick" ? "빠른 검토 그룹" : "유사 사진 그룹"}</h2>
-                <span>{result.groups.length}</span>
+                <h2>{session.mode === "quick" ? "검토할 사진" : "분석 사진"}</h2>
+                <span>{visibleGroups.length}</span>
               </div>
               <div className="group-list">
-                {result.groups.map((group, index) => (
+                {visibleGroups.map((group, index) => (
                   <button
                     key={group.id}
                     className={`group-row ${index === selectedGroupIndex ? "selected" : ""}`}
@@ -973,10 +1044,16 @@ export function App() {
                       ))}
                     </span>
                     <span className="group-copy">
-                      <strong>그룹 {index + 1}</strong>
-                      <small>{group.member_count}장 · {group.folder_count}개 폴더 · 최대 {group.max_similarity}%</small>
+                      <strong>{group.member_count === 1 ? `단독 사진 ${index + 1}` : `그룹 ${index + 1}`}</strong>
+                      <small>
+                        {group.member_count === 1
+                          ? "1장, 보관 또는 삭제 가능"
+                          : `${group.member_count}장, ${group.folder_count}개 폴더, 최대 ${group.max_similarity}%`}
+                      </small>
                     </span>
-                    <span className="group-count">{group.images.filter((image) => image.marked).length}</span>
+                    <span className={`group-count ${group.images.some((image) => image.marked) ? "" : "empty"}`}>
+                      {group.images.filter((image) => image.marked).length}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -1001,10 +1078,15 @@ export function App() {
             <ScanningView session={session} />
           ) : result && result.groups.length === 0 ? (
             <EmptyResults result={result} onRescan={startScan} />
+          ) : result && visibleGroups.length === 0 ? (
+            <HiddenSingletonsView
+              count={result.groups.filter((group) => group.images.length === 1).length}
+              onShow={() => updateSingletonVisibility(true)}
+            />
           ) : result && currentGroup && selectedPhoto && session ? (
             <ReviewWorkspace
               scanId={session.id}
-              result={result}
+              groupCount={visibleGroups.length}
               group={currentGroup}
               groupIndex={selectedGroupIndex}
               selectedPhoto={selectedPhoto}
@@ -1016,7 +1098,7 @@ export function App() {
               throughCurrentMarkedBytes={throughCurrentMarkedBytes}
               mode={session.mode}
               onPrevious={() => selectGroup(Math.max(0, selectedGroupIndex - 1))}
-              onNext={() => selectGroup(Math.min(result.groups.length - 1, selectedGroupIndex + 1))}
+              onNext={() => selectGroup(Math.min(visibleGroups.length - 1, selectedGroupIndex + 1))}
               onSelectPhoto={setSelectedPhotoId}
               onToggleMarked={() => toggleMarked(selectedPhoto.id)}
               onMarkAll={() => markCurrentGroup(true)}
@@ -1066,7 +1148,7 @@ export function App() {
       {guide && (
         <GuideOverlay
           guide={guide}
-          hasReview={Boolean(result && result.groups.length > 0)}
+          hasReview={visibleGroups.length > 0}
           onChange={changeGuide}
           onClose={closeGuide}
         />
@@ -1153,6 +1235,20 @@ function EmptyResults({ result, onRescan }: { result: ScanResult; onRescan: () =
   );
 }
 
+function HiddenSingletonsView({ count, onShow }: { count: number; onShow: () => void }) {
+  return (
+    <div className="welcome-view">
+      <div className="welcome-icon"><ImageSquare size={40} weight="duotone" /></div>
+      <h1>단독 사진을 숨겼습니다</h1>
+      <p>
+        현재 표시할 유사 사진 그룹이 없습니다. 숨겨진 단독 사진 {count.toLocaleString()}장은
+        언제든 다시 표시할 수 있습니다.
+      </p>
+      <button className="button button-secondary" onClick={onShow}>단독 사진 표시</button>
+    </div>
+  );
+}
+
 function StorageCompletionView({
   outcome,
   destination,
@@ -1192,7 +1288,7 @@ function CompletionView({ outcome, onStartOver }: { outcome: CleanupOutcome; onS
 
 type ReviewProps = {
   scanId: string;
-  result: ScanResult;
+  groupCount: number;
   group: PhotoGroup;
   groupIndex: number;
   selectedPhoto: Photo;
@@ -1217,21 +1313,21 @@ type ReviewProps = {
 };
 
 function ReviewWorkspace(props: ReviewProps) {
-  const { result, group, groupIndex, selectedPhoto } = props;
+  const { group, groupIndex, selectedPhoto } = props;
   const visibleColumns = Math.min(group.images.length, 3);
   return (
     <div className="review-workspace">
       <div className="review-toolbar" data-guide="review-toolbar">
         <div className="review-summary">
-          <strong>그룹 {groupIndex + 1}</strong>
-          <span>{result.groups.length}개 중</span>
+          <strong>{group.member_count === 1 ? `단독 사진 ${groupIndex + 1}` : `그룹 ${groupIndex + 1}`}</strong>
+          <span>{props.groupCount}개 중</span>
           <span className="separator" />
           <span>{group.member_count}장</span>
           <span>{group.folder_count}개 폴더</span>
         </div>
         <div className="group-navigation">
           <button className="icon-button" aria-label="이전 그룹" onClick={props.onPrevious} disabled={groupIndex === 0}><ArrowLeft size={18} /></button>
-          <button className="icon-button" aria-label="다음 그룹" onClick={props.onNext} disabled={groupIndex === result.groups.length - 1}><ArrowRight size={18} /></button>
+          <button className="icon-button" aria-label="다음 그룹" onClick={props.onNext} disabled={groupIndex === props.groupCount - 1}><ArrowRight size={18} /></button>
         </div>
       </div>
 
@@ -1239,7 +1335,11 @@ function ReviewWorkspace(props: ReviewProps) {
         className="swipe-gallery"
         data-guide="swipe"
         style={{ "--gallery-columns": visibleColumns } as CSSProperties}
-        aria-label={`그룹 ${groupIndex + 1} 사진 ${group.images.length}장`}
+        aria-label={
+          group.member_count === 1
+            ? "단독 사진 1장"
+            : `그룹 ${groupIndex + 1} 사진 ${group.images.length}장`
+        }
       >
         {group.images.map((image, index) => (
           <SwipePhotoViewer
@@ -1248,7 +1348,7 @@ function ReviewWorkspace(props: ReviewProps) {
             photo={image}
             selected={image.id === selectedPhoto.id}
             shortcutNumber={index < 9 ? index + 1 : null}
-            keepLabel={props.mode === "quick" ? image.id === group.keep_id ? "추천 보존" : "보존" : "보관"}
+            keepLabel={group.member_count === 1 ? "보관" : props.mode === "quick" ? image.id === group.keep_id ? "추천 보존" : "보존" : "보관"}
             onSelect={() => props.onSelectPhoto(image.id)}
             onSave={() => props.onSwipeDecision(image.id, false)}
             onDelete={() => props.onSwipeDecision(image.id, true)}
@@ -1258,7 +1358,7 @@ function ReviewWorkspace(props: ReviewProps) {
 
       <div className="filmstrip-section" data-guide="filmstrip">
         <div className="filmstrip-heading">
-          <span>이 그룹의 사진</span>
+          <span>{group.member_count === 1 ? "단독 사진" : "이 그룹의 사진"}</span>
           <div className="group-tools">
             <button className="keep-all" onClick={props.onKeepAll}><Check size={14} weight="bold" />전부 보관 <kbd>⇧N</kbd></button>
             <button className="mark-all" onClick={props.onMarkAll}><WarningCircle size={14} weight="fill" />전부 후보 <kbd>⇧A</kbd></button>

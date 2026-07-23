@@ -1,4 +1,6 @@
+import errno
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -62,7 +64,27 @@ def test_moves_photos_into_capture_date_directories(tmp_path: Path) -> None:
     assert (destination / "Photos" / "20240304" / "second.jpg").read_bytes() == b"second"
 
 
-def test_existing_filename_is_not_overwritten(tmp_path: Path) -> None:
+def test_moves_photo_from_single_photo_group(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    result = make_result(source)
+    result["groups"][0]["images"] = [result["groups"][0]["images"][0]]
+
+    outcome = move_selection_to_storage(result, ["first"], destination)
+
+    assert outcome["failures"] == []
+    assert outcome["moved"] == [
+        {
+            "source": str(source / "first.jpg"),
+            "destination": str(destination / "Photos" / "20240102" / "first.jpg"),
+        }
+    ]
+    assert (destination / "Photos" / "20240102" / "first.jpg").read_bytes() == b"first"
+
+
+def test_existing_filename_with_different_hash_is_not_overwritten(tmp_path: Path) -> None:
     source = tmp_path / "source"
     destination = tmp_path / "archive"
     source.mkdir()
@@ -71,14 +93,44 @@ def test_existing_filename_is_not_overwritten(tmp_path: Path) -> None:
     target_folder = destination / "Photos" / "20240102"
     target_folder.mkdir(parents=True)
     existing = target_folder / "first.jpg"
-    existing.write_bytes(b"existing")
+    existing.write_bytes(b"other")
 
     outcome = move_selection_to_storage(result, ["first"], destination)
 
     renamed = target_folder / "first (1).jpg"
     assert outcome["moved"][0]["destination"] == str(renamed)
-    assert existing.read_bytes() == b"existing"
+    assert existing.read_bytes() == b"other"
     assert renamed.read_bytes() == b"first"
+
+
+def test_existing_file_with_same_hash_is_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    result = make_result(source)
+    target_folder = destination / "Photos" / "20240102"
+    target_folder.mkdir(parents=True)
+    existing = target_folder / "first.jpg"
+    existing.write_bytes(b"first")
+
+    def reject_rename(source_path: str, destination_path: str) -> None:
+        raise OSError(errno.EXDEV, "cross-device link", destination_path)
+
+    monkeypatch.setattr(shutil.os, "rename", reject_rename)
+
+    outcome = move_selection_to_storage(result, ["first"], destination)
+
+    assert outcome["failures"] == []
+    assert outcome["moved"] == [
+        {"source": str(source / "first.jpg"), "destination": str(existing)}
+    ]
+    assert not (source / "first.jpg").exists()
+    assert existing.read_bytes() == b"first"
+    assert not (target_folder / "first (1).jpg").exists()
 
 
 def test_kept_photo_can_be_stored_after_candidate_moves_to_trash(tmp_path: Path) -> None:
@@ -170,3 +222,33 @@ def test_move_failure_reports_source_destination_and_reason(tmp_path: Path) -> N
         }
     ]
     assert (source / "first.jpg").is_file()
+
+
+def test_cross_filesystem_move_does_not_copy_unsupported_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    result = make_result(source)
+
+    def reject_rename(source_path: str, destination_path: str) -> None:
+        raise OSError(errno.EXDEV, "cross-device link", destination_path)
+
+    def reject_metadata(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EINVAL, "invalid argument")
+
+    monkeypatch.setattr(shutil.os, "rename", reject_rename)
+    monkeypatch.setattr(shutil, "copystat", reject_metadata)
+
+    outcome = move_selection_to_storage(result, ["first"], destination)
+
+    target = destination / "Photos" / "20240102" / "first.jpg"
+    assert outcome["failures"] == []
+    assert outcome["moved"] == [
+        {"source": str(source / "first.jpg"), "destination": str(target)}
+    ]
+    assert not (source / "first.jpg").exists()
+    assert target.read_bytes() == b"first"

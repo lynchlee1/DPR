@@ -75,6 +75,22 @@ def test_move_can_explicitly_trash_every_image_in_a_group(tmp_path: Path) -> Non
     assert moved == [str(tmp_path / "first.jpg"), str(tmp_path / "second.jpg")]
 
 
+def test_single_photo_group_can_be_trashed_after_explicit_confirmation(tmp_path: Path) -> None:
+    result = make_result(tmp_path)
+    result["groups"][0]["images"] = [result["groups"][0]["images"][0]]
+    moved: list[str] = []
+
+    outcome = move_selection_to_trash(
+        result,
+        ["first"],
+        allow_delete_all=True,
+        mover=moved.append,
+    )
+
+    assert outcome == {"moved": [str(tmp_path / "first.jpg")], "failures": []}
+    assert moved == [str(tmp_path / "first.jpg")]
+
+
 def test_nested_photo_is_a_valid_trash_target(tmp_path: Path) -> None:
     nested = tmp_path / "album" / "day-one"
     nested.mkdir(parents=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -8,6 +9,11 @@ from typing import Callable, Iterable
 
 
 StorageMover = Callable[[str, str], object]
+
+
+def _move_file(source: str, destination: str) -> object:
+    # copy2 can fail while applying unsupported metadata to ExFAT after copying the data.
+    return shutil.move(source, destination, copy_function=shutil.copyfile)
 
 
 def validate_storage_selection(
@@ -59,6 +65,21 @@ def _unique_destination(path: Path) -> Path:
     raise FileExistsError(f"같은 이름의 파일이 너무 많습니다: {path.name}")
 
 
+def _sha256(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _files_have_same_hash(first: Path, second: Path) -> bool:
+    return (
+        first.stat().st_size == second.stat().st_size
+        and _sha256(first) == _sha256(second)
+    )
+
+
 def move_selection_to_storage(
     result: dict,
     image_ids: Iterable[str],
@@ -66,7 +87,7 @@ def move_selection_to_storage(
     mover: StorageMover | None = None,
 ) -> dict:
     destination, images = validate_storage_selection(result, image_ids, destination)
-    mover = mover or shutil.move
+    mover = mover or _move_file
     moved: list[dict[str, str]] = []
     failures: list[dict[str, str]] = []
     planned: list[tuple[Path, Path]] = []
@@ -95,6 +116,11 @@ def move_selection_to_storage(
             expected_target = (target_folder / source.name).resolve()
             if source == expected_target:
                 target = expected_target
+            elif expected_target.is_file() and _files_have_same_hash(
+                source, expected_target
+            ):
+                target = expected_target
+                mover(str(source), str(target))
             else:
                 target = _unique_destination(expected_target)
                 mover(str(source), str(target))

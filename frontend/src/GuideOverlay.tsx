@@ -59,8 +59,8 @@ const SETUP_STEPS: GuideStep[] = [
 const REVIEW_STEPS: GuideStep[] = [
   {
     target: '[data-guide="groups"]',
-    title: "검토할 그룹을 선택하세요",
-    copy: "왼쪽 목록에서 그룹을 고릅니다. 오른쪽 숫자는 현재 그룹에서 선택한 삭제 후보 수입니다.",
+    title: "검토할 사진을 선택하세요",
+    copy: "왼쪽 목록에는 유사 사진 그룹과 단독 사진이 함께 표시됩니다. 오른쪽 숫자는 현재 선택된 삭제 후보 수입니다.",
   },
   {
     target: '[data-guide="review-toolbar"]',
