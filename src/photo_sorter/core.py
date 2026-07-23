@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from functools import lru_cache
 import hashlib
 import math
@@ -20,6 +20,7 @@ from PIL import Image, ImageOps
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
 EXIF_TIME_KEYS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, DateTime
 ProgressCallback = Callable[[int, int, str], None]
+DateRangeCallback = Callable[[str | None, str | None], None]
 
 
 @dataclass(frozen=True)
@@ -165,18 +166,35 @@ def _fingerprints(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return phash, dhash, ahash, histogram, sharpness
 
 
-def analyze_image(path: Path) -> ImageRecord:
+def analyze_image(
+    path: Path,
+    capture_info: tuple[datetime, str] | None = None,
+) -> ImageRecord:
     resolved = path.resolve()
     stat = resolved.stat()
-    return _analyze_image_cached(str(resolved), stat.st_mtime_ns, stat.st_size)
+    captured_at, time_source = capture_info or (None, None)
+    return _analyze_image_cached(
+        str(resolved),
+        stat.st_mtime_ns,
+        stat.st_size,
+        captured_at,
+        time_source,
+    )
 
 
 @lru_cache(maxsize=10_000)
-def _analyze_image_cached(path_text: str, modified_ns: int, size_bytes: int) -> ImageRecord:
+def _analyze_image_cached(
+    path_text: str,
+    modified_ns: int,
+    size_bytes: int,
+    captured_at: datetime | None,
+    time_source: str | None,
+) -> ImageRecord:
     del modified_ns  # The value participates in the cache key.
     path = Path(path_text)
     with Image.open(path) as source:
-        captured_at, time_source = capture_time(path, source)
+        if captured_at is None or time_source is None:
+            captured_at, time_source = capture_time(path, source)
         original_width, original_height = source.size
         orientation = source.getexif().get(274, 1)
         source.draft("RGB", (160, 160))
@@ -203,6 +221,12 @@ def _analyze_image_cached(path_text: str, modified_ns: int, size_bytes: int) -> 
         color_histogram=histogram,
         sharpness=sharpness,
     )
+
+
+def clear_analysis_cache() -> int:
+    entry_count = _analyze_image_cached.cache_info().currsize
+    _analyze_image_cached.cache_clear()
+    return entry_count
 
 
 def similarity(left: ImageRecord, right: ImageRecord) -> float:
@@ -248,7 +272,7 @@ def _matching_components(
     for member in members:
         root = find(member.id)
         grouped.setdefault(root, []).append(by_id[member.id])
-    return [component for component in grouped.values() if len(component) > 1]
+    return list(grouped.values())
 
 
 def scan_folder(
@@ -259,6 +283,9 @@ def scan_folder(
     max_workers: int | None = None,
     keeper_strategy: Literal["quality", "latest"] = "quality",
     include_subfolders: bool = True,
+    day_limit: int | None = None,
+    date_order: Literal["oldest", "newest"] = "oldest",
+    on_date_range: DateRangeCallback | None = None,
 ) -> dict:
     started = time.perf_counter()
     folder = folder.expanduser().resolve()
@@ -270,19 +297,65 @@ def scan_folder(
         raise ValueError("시간 간격은 1초 이상이어야 합니다.")
     if keeper_strategy not in {"quality", "latest"}:
         raise ValueError("보존 사진 선택 방식이 올바르지 않습니다.")
+    if day_limit is not None and day_limit < 1:
+        raise ValueError("분석 날짜 수는 1일 이상이어야 합니다.")
+    if date_order not in {"oldest", "newest"}:
+        raise ValueError("날짜 정렬 방향이 올바르지 않습니다.")
 
     paths = discover_images(folder, include_subfolders=include_subfolders)
-    if on_progress:
-        on_progress(0, len(paths), "analyzing")
-
     records: list[ImageRecord] = []
     failures: list[dict[str, str]] = []
     progress_lock = threading.Lock()
-    completed = 0
     workers = max_workers or min(8, max(2, (os.cpu_count() or 4)))
+    capture_info_by_path: dict[Path, tuple[datetime, str]] = {}
+    paths_to_analyze = paths
+    available_days: set[date] = set()
+    selected_capture_days: set[date] = set()
 
+    if day_limit is not None:
+        if on_progress:
+            on_progress(0, len(paths), "indexing")
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(capture_time, path): path for path in paths}
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    capture_info_by_path[path] = future.result()
+                except Exception as exc:
+                    failures.append({"path": str(path), "reason": str(exc)})
+                with progress_lock:
+                    completed += 1
+                    if on_progress:
+                        on_progress(completed, len(paths), "indexing")
+
+        available_days = {
+            captured_at.date()
+            for captured_at, _ in capture_info_by_path.values()
+        }
+        ordered_days = sorted(available_days, reverse=date_order == "newest")
+        selected_capture_days = set(ordered_days[:day_limit])
+        paths_to_analyze = [
+            path
+            for path in paths
+            if path in capture_info_by_path
+            and capture_info_by_path[path][0].date() in selected_capture_days
+        ]
+        if on_date_range:
+            on_date_range(
+                min(selected_capture_days).isoformat() if selected_capture_days else None,
+                max(selected_capture_days).isoformat() if selected_capture_days else None,
+            )
+
+    if on_progress:
+        on_progress(0, len(paths_to_analyze), "analyzing")
+
+    completed = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(analyze_image, path): path for path in paths}
+        futures = {
+            pool.submit(analyze_image, path, capture_info_by_path.get(path)): path
+            for path in paths_to_analyze
+        }
         for future in as_completed(futures):
             path = futures[future]
             try:
@@ -292,9 +365,17 @@ def scan_folder(
             with progress_lock:
                 completed += 1
                 if on_progress:
-                    on_progress(completed, len(paths), "analyzing")
+                    on_progress(completed, len(paths_to_analyze), "analyzing")
 
     records.sort(key=lambda record: (record.captured_at, record.path.name.casefold(), str(record.path)))
+    if day_limit is None:
+        selected_capture_days = {record.captured_at.date() for record in records}
+        available_days = selected_capture_days
+        if on_date_range:
+            on_date_range(
+                min(selected_capture_days).isoformat() if selected_capture_days else None,
+                max(selected_capture_days).isoformat() if selected_capture_days else None,
+            )
     pairs_in_window: list[SimilarityPair] = []
     matching_pairs: list[SimilarityPair] = []
     pair_total = max(len(records) - 1, 0)
@@ -372,8 +453,14 @@ def scan_folder(
                 "images": serialized_images,
                 "member_count": len(members),
                 "folder_count": folder_count,
-                "max_similarity": max(pair.similarity for pair in relevant_pairs),
-                "min_similarity": min(pair.similarity for pair in relevant_pairs),
+                "max_similarity": max(
+                    (pair.similarity for pair in relevant_pairs),
+                    default=100.0,
+                ),
+                "min_similarity": min(
+                    (pair.similarity for pair in relevant_pairs),
+                    default=100.0,
+                ),
                 "time_start": members[0].captured_at.isoformat(),
                 "time_end": members[-1].captured_at.isoformat(),
             }
@@ -388,15 +475,32 @@ def scan_folder(
         "time_window_seconds": time_window_seconds,
         "keeper_strategy": keeper_strategy,
         "include_subfolders": include_subfolders,
+        "day_limit": day_limit,
+        "date_order": date_order,
+        "selected_date_start": (
+            min(selected_capture_days).isoformat()
+            if selected_capture_days
+            else None
+        ),
+        "selected_date_end": (
+            max(selected_capture_days).isoformat()
+            if selected_capture_days
+            else None
+        ),
         "groups": groups,
         "failures": failures,
         "stats": {
             "found": len(paths),
-            "source_folders": len({path.parent for path in paths}),
+            "selected": len(paths_to_analyze),
+            "source_folders": len({path.parent for path in paths_to_analyze}),
+            "available_days": len(available_days),
+            "selected_days": len(selected_capture_days),
             "analyzed": len(records),
             "pairs_compared": len(pairs_in_window),
             "matched_pairs": len(matching_pairs),
             "groups": len(groups),
+            "similar_groups": sum(group["member_count"] > 1 for group in groups),
+            "singletons": sum(group["member_count"] == 1 for group in groups),
             "marked_count": len(marked_images),
             "marked_bytes": sum(image["size_bytes"] for image in marked_images),
             "duration_seconds": round(duration, 2),

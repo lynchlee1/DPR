@@ -1,8 +1,10 @@
 import {
+  ArrowCounterClockwise,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  CaretDown,
   Check,
   CheckCircle,
   FolderOpen,
@@ -23,6 +25,7 @@ import { GuideOverlay, type GuideState } from "./GuideOverlay";
 
 type ScanStatus = "queued" | "running" | "complete" | "error";
 type AnalysisMode = "standard" | "quick";
+type DateOrder = "oldest" | "newest";
 
 const DEFAULT_QUICK_THRESHOLD = 96;
 const SETUP_GUIDE_KEY = "photo-sorter-setup-guide-v1";
@@ -64,11 +67,18 @@ type ScanResult = {
   time_window_seconds: number;
   keeper_strategy: "quality" | "latest";
   include_subfolders: boolean;
+  day_limit: number | null;
+  date_order: DateOrder;
+  selected_date_start: string | null;
+  selected_date_end: string | null;
   groups: PhotoGroup[];
   failures: { path: string; reason: string }[];
   stats: {
     found: number;
+    selected: number;
     source_folders: number;
+    available_days: number;
+    selected_days: number;
     analyzed: number;
     pairs_compared: number;
     matched_pairs: number;
@@ -86,8 +96,12 @@ type Session = {
   time_window_seconds: number;
   mode: AnalysisMode;
   include_subfolders: boolean;
+  day_limit: number | null;
+  date_order: DateOrder;
+  selected_date_start: string | null;
+  selected_date_end: string | null;
   status: ScanStatus;
-  phase: "queued" | "analyzing" | "comparing" | "complete" | "error";
+  phase: "queued" | "indexing" | "analyzing" | "comparing" | "complete" | "error";
   completed: number;
   total: number;
   result: ScanResult | null;
@@ -97,6 +111,11 @@ type Session = {
 type CleanupOutcome = {
   moved: string[];
   failures: { path: string; reason: string }[];
+};
+
+type StorageOutcome = {
+  moved: { source: string; destination: string }[];
+  failures: { path: string; destination?: string; reason: string }[];
 };
 
 function formatBytes(bytes: number): string {
@@ -120,6 +139,18 @@ function formatDate(value: string): string {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(value));
+}
+
+function formatDateOnly(value: string): string {
+  const [year, month, day] = value.split("-");
+  return `${year}.${month}.${day}.`;
+}
+
+function formatSelectedPeriod(start: string | null, end: string | null): string {
+  if (!start || !end) return "선정된 파일 없음";
+  const formattedStart = formatDateOnly(start);
+  const formattedEnd = formatDateOnly(end);
+  return start === end ? formattedStart : `${formattedStart} ~ ${formattedEnd}`;
 }
 
 function shortPath(path: string): string {
@@ -207,46 +238,35 @@ function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult
   };
 }
 
-function removeReviewedGroups(result: ScanResult, throughGroupIndex: number, movedPaths: string[]): ScanResult {
-  const moved = new Set(movedPaths);
-  const completedGroupIds = new Set(
-    result.groups
-      .slice(0, throughGroupIndex + 1)
-      .filter((group) => group.images.filter((image) => image.marked).every((image) => moved.has(image.path)))
-      .map((group) => group.id),
-  );
-  const afterMove = removeMovedPhotos(result, movedPaths);
-  const groups = afterMove.groups.filter((group) => !completedGroupIds.has(group.id));
-  const marked = groups.flatMap((group) => group.images).filter((image) => image.marked);
-  return {
-    ...afterMove,
-    groups,
-    stats: {
-      ...afterMove.stats,
-      groups: groups.length,
-      marked_count: marked.length,
-      marked_bytes: marked.reduce((total, image) => total + image.size_bytes, 0),
-    },
-  };
-}
-
 export function App() {
   const [folder, setFolder] = useState(() => localStorage.getItem("photo-sorter-folder") || "");
+  const [destination, setDestination] = useState(() => localStorage.getItem("photo-sorter-destination") || "");
   const [threshold, setThreshold] = useState(88);
   const [quickThreshold, setQuickThreshold] = useState(DEFAULT_QUICK_THRESHOLD);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("standard");
   const [includeSubfolders, setIncludeSubfolders] = useState(
     () => localStorage.getItem("photo-sorter-include-subfolders") !== "false",
   );
+  const [dayLimit, setDayLimit] = useState(() => localStorage.getItem("photo-sorter-day-limit") || "");
+  const [dateOrder, setDateOrder] = useState<DateOrder>(
+    () => localStorage.getItem("photo-sorter-date-order") === "newest" ? "newest" : "oldest",
+  );
+  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
   const [selectedGroupIndex, setSelectedGroupIndex] = useState(0);
   const [selectedPhotoId, setSelectedPhotoId] = useState<string | null>(null);
   const [isPickingFolder, setIsPickingFolder] = useState(false);
+  const [isPickingDestination, setIsPickingDestination] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [resetNotice, setResetNotice] = useState<string | null>(null);
   const [isTrashDialogOpen, setIsTrashDialogOpen] = useState(false);
   const [trashThroughGroupIndex, setTrashThroughGroupIndex] = useState<number | null>(null);
   const [isTrashing, setIsTrashing] = useState(false);
   const [cleanupOutcome, setCleanupOutcome] = useState<CleanupOutcome | null>(null);
+  const [isStorageDialogOpen, setIsStorageDialogOpen] = useState(false);
+  const [isStoring, setIsStoring] = useState(false);
+  const [storageOutcome, setStorageOutcome] = useState<StorageOutcome | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [guide, setGuide] = useState<GuideState | null>(() =>
     localStorage.getItem(SETUP_GUIDE_KEY) ? null : { kind: "setup", step: 0 },
@@ -264,7 +284,12 @@ export function App() {
     () => result?.groups.flatMap((group) => group.images).filter((image) => image.marked) ?? [],
     [result],
   );
+  const keptPhotos = useMemo(
+    () => result?.groups.flatMap((group) => group.images).filter((image) => !image.marked) ?? [],
+    [result],
+  );
   const markedBytes = markedPhotos.reduce((total, image) => total + image.size_bytes, 0);
+  const keptBytes = keptPhotos.reduce((total, image) => total + image.size_bytes, 0);
   const groupsInTrashScope = result
     ? trashThroughGroupIndex === null
       ? result.groups
@@ -279,6 +304,14 @@ export function App() {
     result?.groups.slice(0, selectedGroupIndex + 1).flatMap((group) => group.images).filter((image) => image.marked) ?? [];
   const throughCurrentMarkedBytes = throughCurrentMarkedPhotos.reduce((total, image) => total + image.size_bytes, 0);
   const activeThreshold = analysisMode === "quick" ? quickThreshold : threshold;
+  const isDayLimitValid = dayLimit === "" || (/^\d+$/.test(dayLimit) && Number(dayLimit) >= 1);
+  const advancedSummary = !isDayLimitValid
+    ? "분석 날짜 수를 확인하세요"
+    : [
+        includeSubfolders ? "하위 폴더 포함" : "현재 폴더만",
+        dayLimit ? `${dateOrder === "oldest" ? "오래된 날부터" : "최신 날부터"} ${dayLimit}일` : "전체 기간",
+        `유사도 ${activeThreshold}%`,
+      ].join(", ");
 
   useEffect(() => {
     if (!session || session.status === "complete" || session.status === "error") return;
@@ -327,7 +360,7 @@ export function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (!result || isTrashDialogOpen || guide) return;
+      if (!result || isTrashDialogOpen || isStorageDialogOpen || guide) return;
       if (event.repeat) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
@@ -380,6 +413,7 @@ export function App() {
         setResult(null);
         setSession(null);
         setCleanupOutcome(null);
+        setStorageOutcome(null);
       }
     } catch (pickError) {
       setError(pickError instanceof Error ? pickError.message : "폴더를 선택하지 못했습니다.");
@@ -388,10 +422,61 @@ export function App() {
     }
   }
 
+  async function pickDestination() {
+    setIsPickingDestination(true);
+    setError(null);
+    try {
+      const picked = await api<{ path: string | null }>("/api/folders/pick?purpose=destination", { method: "POST" });
+      if (picked.path) {
+        setDestination(picked.path);
+        localStorage.setItem("photo-sorter-destination", picked.path);
+      }
+    } catch (pickError) {
+      setError(pickError instanceof Error ? pickError.message : "저장 디렉터리를 선택하지 못했습니다.");
+    } finally {
+      setIsPickingDestination(false);
+    }
+  }
+
+  async function resetCalculations() {
+    const confirmed = window.confirm(
+      "현재 분석 결과와 검토 상태를 지우고 메모리를 정리합니다. 원본 사진은 삭제되지 않습니다. 계속할까요?",
+    );
+    if (!confirmed) return;
+
+    setIsResetting(true);
+    setError(null);
+    setResetNotice(null);
+    try {
+      await api("/api/calculations/reset", { method: "POST" });
+      setSession(null);
+      setResult(null);
+      setSelectedGroupIndex(0);
+      setSelectedPhotoId(null);
+      setIsTrashDialogOpen(false);
+      setTrashThroughGroupIndex(null);
+      setCleanupOutcome(null);
+      setIsStorageDialogOpen(false);
+      setStorageOutcome(null);
+      setGuide(null);
+      setResetNotice("계산값과 현재 분석 결과를 초기화했습니다.");
+    } catch (resetError) {
+      setError(resetError instanceof Error ? resetError.message : "계산값을 초기화하지 못했습니다.");
+    } finally {
+      setIsResetting(false);
+    }
+  }
+
   async function startScan() {
     setError(null);
+    setResetNotice(null);
     setCleanupOutcome(null);
+    setStorageOutcome(null);
     setResult(null);
+    if (!isDayLimitValid) {
+      setError("분석 날짜 수는 1일 이상의 숫자로 입력해 주세요.");
+      return;
+    }
     try {
       localStorage.setItem("photo-sorter-folder", folder);
       const next = await api<Session>("/api/scans", {
@@ -402,6 +487,8 @@ export function App() {
           time_window_seconds: 60,
           mode: analysisMode,
           include_subfolders: includeSubfolders,
+          day_limit: dayLimit === "" ? null : Number(dayLimit),
+          date_order: dateOrder,
         }),
       });
       setSession(next);
@@ -462,6 +549,14 @@ export function App() {
     setIsTrashDialogOpen(true);
   }
 
+  function openStorageDialog() {
+    if (!destination.trim()) {
+      setError("보관 사진을 옮길 저장 디렉터리를 선택해 주세요.");
+      return;
+    }
+    setIsStorageDialogOpen(true);
+  }
+
   function closeGuide() {
     if (guide?.kind === "setup") localStorage.setItem(SETUP_GUIDE_KEY, "complete");
     if (guide?.kind === "review") localStorage.setItem(REVIEW_GUIDE_KEY, "complete");
@@ -476,31 +571,67 @@ export function App() {
     setGuide(nextGuide);
   }
 
+  function showRemainingPhotos(
+    nextResult: ScanResult,
+    preferredPhotoId: string | null,
+    preferredGroupIndex?: number,
+  ) {
+    setResult(nextResult);
+    if (nextResult.groups.length === 0) {
+      setSelectedGroupIndex(0);
+      setSelectedPhotoId(null);
+      return;
+    }
+
+    const nextGroupIndex = preferredGroupIndex ?? Math.min(selectedGroupIndex, nextResult.groups.length - 1);
+    const nextGroup = nextResult.groups[nextGroupIndex];
+    const preservedSelection = nextGroup.images.find((image) => image.id === preferredPhotoId);
+    setSelectedGroupIndex(nextGroupIndex);
+    setSelectedPhotoId(preservedSelection?.id ?? firstReviewPhoto(nextGroup)?.id ?? null);
+  }
+
+  async function storeKeptPhotos() {
+    if (!session || !result || keptPhotos.length === 0 || !destination.trim()) return;
+    const resultBeforeMove = result;
+    const selectedPhotoIdBeforeMove = selectedPhotoId;
+    const keptPaths = keptPhotos.map((image) => image.path);
+
+    setIsStoring(true);
+    setIsStorageDialogOpen(false);
+    setError(null);
+    setCleanupOutcome(null);
+    showRemainingPhotos(removeMovedPhotos(resultBeforeMove, keptPaths), selectedPhotoIdBeforeMove);
+    try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      const outcome = await api<StorageOutcome>(`/api/scans/${session.id}/store`, {
+        method: "POST",
+        body: JSON.stringify({
+          image_ids: keptPhotos.map((image) => image.id),
+          destination,
+        }),
+      });
+      setStorageOutcome(outcome);
+      showRemainingPhotos(
+        removeMovedPhotos(resultBeforeMove, outcome.moved.map((item) => item.source)),
+        selectedPhotoIdBeforeMove,
+      );
+    } catch (storageError) {
+      showRemainingPhotos(resultBeforeMove, selectedPhotoIdBeforeMove);
+      setError(storageError instanceof Error ? storageError.message : "보관 사진을 저장 위치로 옮기지 못했습니다.");
+    } finally {
+      setIsStoring(false);
+    }
+  }
+
   async function trashMarked() {
     if (!session || !result || pendingTrashPhotos.length === 0) return;
     const resultBeforeTrash = result;
     const selectedPhotoIdBeforeTrash = selectedPhotoId;
     const candidatePaths = pendingTrashPhotos.map((image) => image.path);
-    const processedThroughGroupIndex = trashThroughGroupIndex;
-
-    function showRemainingPhotos(nextResult: ScanResult, preferredPhotoId: string | null, preferredGroupIndex?: number) {
-      setResult(nextResult);
-      if (nextResult.groups.length === 0) {
-        setSelectedGroupIndex(0);
-        setSelectedPhotoId(null);
-        return;
-      }
-
-      const nextGroupIndex = preferredGroupIndex ?? Math.min(selectedGroupIndex, nextResult.groups.length - 1);
-      const nextGroup = nextResult.groups[nextGroupIndex];
-      const preservedSelection = nextGroup.images.find((image) => image.id === preferredPhotoId);
-      setSelectedGroupIndex(nextGroupIndex);
-      setSelectedPhotoId(preservedSelection?.id ?? firstReviewPhoto(nextGroup)?.id ?? null);
-    }
-
     setIsTrashing(true);
     setIsTrashDialogOpen(false);
     setError(null);
+    setStorageOutcome(null);
     // Remove pending cards before the files move so lazy image requests cannot
     // race the trash operation and request a path that has just disappeared.
     showRemainingPhotos(removeMovedPhotos(resultBeforeTrash, candidatePaths), selectedPhotoIdBeforeTrash);
@@ -514,15 +645,15 @@ export function App() {
         }),
       });
       setCleanupOutcome(outcome);
-      if (processedThroughGroupIndex === null) {
-        showRemainingPhotos(removeMovedPhotos(resultBeforeTrash, outcome.moved), selectedPhotoIdBeforeTrash);
-      } else {
-        showRemainingPhotos(
-          removeReviewedGroups(resultBeforeTrash, processedThroughGroupIndex, outcome.moved),
-          null,
-          0,
-        );
-      }
+      const nextResult = removeMovedPhotos(resultBeforeTrash, outcome.moved);
+      const nextCandidateGroupIndex = nextResult.groups.findIndex(
+        (group) => group.images.some((image) => image.marked),
+      );
+      showRemainingPhotos(
+        nextResult,
+        nextCandidateGroupIndex >= 0 ? null : selectedPhotoIdBeforeTrash,
+        nextCandidateGroupIndex >= 0 ? nextCandidateGroupIndex : undefined,
+      );
     } catch (trashError) {
       showRemainingPhotos(resultBeforeTrash, selectedPhotoIdBeforeTrash);
       setError(trashError instanceof Error ? trashError.message : "휴지통으로 이동하지 못했습니다.");
@@ -543,6 +674,10 @@ export function App() {
           <button ref={helpButtonRef} className="button button-secondary compact" onClick={() => setGuide({ kind: "menu", step: 0 })}>
             <Question size={16} weight="bold" />사용법
           </button>
+          <button className="button button-secondary compact" onClick={resetCalculations} disabled={isScanning || isResetting}>
+            <ArrowCounterClockwise size={16} />
+            {isResetting ? "초기화 중" : "계산값 초기화"}
+          </button>
           <button className="button button-secondary compact" onClick={pickFolder} disabled={isPickingFolder || isScanning}>
             <FolderOpen size={16} />
             {isPickingFolder ? "선택 중" : "폴더 선택"}
@@ -558,13 +693,44 @@ export function App() {
         </div>
       )}
 
+      {resetNotice && (
+        <div className="cleanup-banner" role="status">
+          <CheckCircle size={18} weight="fill" />
+          <span>{resetNotice}</span>
+          <button aria-label="알림 닫기" onClick={() => setResetNotice(null)}><X size={16} /></button>
+        </div>
+      )}
+
+      {storageOutcome && result && result.groups.length > 0 && (
+        <div className={`cleanup-banner ${storageOutcome.failures.length ? "has-failures" : ""}`} role="status">
+          {storageOutcome.failures.length ? <WarningCircle size={18} weight="fill" /> : <CheckCircle size={18} weight="fill" />}
+          <div className="banner-copy">
+            <span>
+              보관 사진 {storageOutcome.moved.length.toLocaleString()}장을 촬영일 폴더로 옮겼습니다.
+              {storageOutcome.failures.length ? ` ${storageOutcome.failures.length.toLocaleString()}장은 옮기지 못했습니다.` : ""}
+              {` 남은 ${result.groups.length.toLocaleString()}개 그룹을 계속 검토할 수 있습니다.`}
+            </span>
+            {storageOutcome.failures[0] && (
+              <small title={`${storageOutcome.failures[0].path}${storageOutcome.failures[0].destination ? ` → ${storageOutcome.failures[0].destination}` : ""}`}>
+                첫 오류: {shortPath(storageOutcome.failures[0].path)}
+                {storageOutcome.failures[0].destination ? ` → ${shortPath(storageOutcome.failures[0].destination)}` : ""}
+                {` · ${storageOutcome.failures[0].reason || "알 수 없는 오류"}`}
+              </small>
+            )}
+          </div>
+          <button aria-label="알림 닫기" onClick={() => setStorageOutcome(null)}><X size={16} /></button>
+        </div>
+      )}
+
       {cleanupOutcome && result && result.groups.length > 0 && (
         <div className={`cleanup-banner ${cleanupOutcome.failures.length ? "has-failures" : ""}`} role="status">
           {cleanupOutcome.failures.length ? <WarningCircle size={18} weight="fill" /> : <CheckCircle size={18} weight="fill" />}
           <span>
             {cleanupOutcome.moved.length.toLocaleString()}장을 휴지통으로 옮겼습니다.
             {cleanupOutcome.failures.length ? ` ${cleanupOutcome.failures.length.toLocaleString()}장은 옮기지 못했습니다.` : ""}
-            {` 남은 ${result.groups.length.toLocaleString()}개 그룹을 계속 검토할 수 있습니다.`}
+            {markedPhotos.length > 0
+              ? ` 남은 ${result.groups.length.toLocaleString()}개 그룹을 계속 검토할 수 있습니다.`
+              : " 남겨 둔 사진을 보관 위치로 옮길 수 있습니다."}
           </span>
           <button aria-label="알림 닫기" onClick={() => setCleanupOutcome(null)}><X size={16} /></button>
         </div>
@@ -575,12 +741,52 @@ export function App() {
           <section className="settings-panel">
             <div className="panel-heading">
               <div>
-                <h2>비교 설정</h2>
-                <p>선택한 폴더 안의 사진을 함께 확인합니다.</p>
+                <h2>분석 설정</h2>
+                <p>폴더와 방식을 정한 뒤 분석을 시작하세요.</p>
               </div>
             </div>
 
-            <span className="field-label" id="analysis-mode-label">분석 방식</span>
+            <label className="field-label" htmlFor="folder-path">사진 폴더</label>
+            <div className="path-input-row" data-guide="folder">
+              <input
+                id="folder-path"
+                value={folder}
+                onChange={(event) => setFolder(event.target.value)}
+                spellCheck={false}
+                disabled={isScanning}
+              />
+              <button className="icon-button" aria-label="폴더 선택" onClick={pickFolder} disabled={isScanning}>
+                <FolderOpen size={18} />
+              </button>
+            </div>
+
+            <label className="field-label destination-label" htmlFor="destination-path">보관 저장 위치</label>
+            <div className="path-input-row">
+              <input
+                id="destination-path"
+                value={destination}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setDestination(value);
+                  if (value) localStorage.setItem("photo-sorter-destination", value);
+                  else localStorage.removeItem("photo-sorter-destination");
+                }}
+                placeholder="저장 루트 폴더"
+                spellCheck={false}
+                disabled={isScanning || isStoring}
+              />
+              <button
+                className="icon-button"
+                aria-label="보관 저장 위치 선택"
+                onClick={pickDestination}
+                disabled={isScanning || isStoring || isPickingDestination}
+              >
+                <FolderOpen size={18} />
+              </button>
+            </div>
+            <p className="destination-help">선택 위치 아래 Photos/YYYYMMDD로 이동합니다.</p>
+
+            <span className="field-label mode-label" id="analysis-mode-label">분석 방식</span>
             <div className="mode-selector" role="radiogroup" aria-labelledby="analysis-mode-label" data-guide="mode">
               <button
                 className={analysisMode === "standard" ? "selected" : ""}
@@ -602,93 +808,147 @@ export function App() {
               </button>
             </div>
             <p className="mode-help">
-              {analysisMode === "quick"
-                ? "보관할 사진을 추천하고 나머지는 삭제 후보로 준비합니다."
-                : "비슷한 사진을 모아 보여 주며, 보관 여부는 직접 선택합니다."}
+              {analysisMode === "quick" ? "보관 사진을 추천하고 후보를 미리 표시합니다." : "보관할 사진을 직접 선택합니다."}
             </p>
 
-            <label className="field-label" htmlFor="folder-path">사진 폴더</label>
-            <div className="path-input-row" data-guide="folder">
-              <input
-                id="folder-path"
-                value={folder}
-                onChange={(event) => setFolder(event.target.value)}
-                spellCheck={false}
-                disabled={isScanning}
-              />
-              <button className="icon-button" aria-label="폴더 선택" onClick={pickFolder} disabled={isScanning}>
-                <FolderOpen size={18} />
+            <div className={`advanced-settings ${isAdvancedOpen ? "open" : ""} ${!isDayLimitValid ? "has-error" : ""}`}>
+              <button
+                className="advanced-settings-toggle"
+                type="button"
+                aria-expanded={isAdvancedOpen}
+                aria-controls="advanced-settings-content"
+                onClick={() => setIsAdvancedOpen((open) => !open)}
+                data-guide="advanced"
+              >
+                <span>
+                  <strong>세부 설정</strong>
+                  <small>{advancedSummary}</small>
+                </span>
+                <CaretDown size={16} weight="bold" aria-hidden="true" />
               </button>
+
+              <div className="advanced-settings-content" id="advanced-settings-content" hidden={!isAdvancedOpen}>
+                <div className="subfolder-setting">
+                  <div>
+                    <strong id="subfolder-label">하위 폴더 탐색</strong>
+                    <span>{includeSubfolders ? "중첩된 모든 폴더의 사진 포함" : "선택한 폴더의 사진만 포함"}</span>
+                  </div>
+                  <div className="binary-selector" role="radiogroup" aria-labelledby="subfolder-label">
+                    <button
+                      className={includeSubfolders ? "selected" : ""}
+                      role="radio"
+                      aria-checked={includeSubfolders}
+                      aria-label="하위 폴더 탐색 O"
+                      onClick={() => {
+                        setIncludeSubfolders(true);
+                        localStorage.setItem("photo-sorter-include-subfolders", "true");
+                      }}
+                      disabled={isScanning}
+                    >
+                      O
+                    </button>
+                    <button
+                      className={!includeSubfolders ? "selected" : ""}
+                      role="radio"
+                      aria-checked={!includeSubfolders}
+                      aria-label="하위 폴더 탐색 X"
+                      onClick={() => {
+                        setIncludeSubfolders(false);
+                        localStorage.setItem("photo-sorter-include-subfolders", "false");
+                      }}
+                      disabled={isScanning}
+                    >
+                      X
+                    </button>
+                  </div>
+                </div>
+
+                <div className="setting-block date-limit-setting">
+                  <div className="setting-row">
+                    <label htmlFor="day-limit">분석 날짜 수</label>
+                    <div className="day-limit-input">
+                      <input
+                        id="day-limit"
+                        type="number"
+                        min="1"
+                        inputMode="numeric"
+                        placeholder="전체"
+                        value={dayLimit}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setDayLimit(value);
+                          if (value) localStorage.setItem("photo-sorter-day-limit", value);
+                          else localStorage.removeItem("photo-sorter-day-limit");
+                        }}
+                        disabled={isScanning}
+                        aria-invalid={!isDayLimitValid}
+                      />
+                      <span>일</span>
+                    </div>
+                  </div>
+                  <p className="setting-help">EXIF 촬영일을 우선해 서로 다른 날짜를 선택합니다.</p>
+                  <div className="date-order-selector" role="radiogroup" aria-label="날짜 정렬 방향">
+                    <button
+                      className={dateOrder === "oldest" ? "selected" : ""}
+                      role="radio"
+                      aria-checked={dateOrder === "oldest"}
+                      onClick={() => {
+                        setDateOrder("oldest");
+                        localStorage.setItem("photo-sorter-date-order", "oldest");
+                      }}
+                      disabled={isScanning}
+                    >
+                      <ArrowUp size={14} />오래된 날부터
+                    </button>
+                    <button
+                      className={dateOrder === "newest" ? "selected" : ""}
+                      role="radio"
+                      aria-checked={dateOrder === "newest"}
+                      onClick={() => {
+                        setDateOrder("newest");
+                        localStorage.setItem("photo-sorter-date-order", "newest");
+                      }}
+                      disabled={isScanning}
+                    >
+                      <ArrowDown size={14} />최신 날부터
+                    </button>
+                  </div>
+                  {!isDayLimitValid && <p className="field-error">1 이상의 숫자를 입력해 주세요.</p>}
+                </div>
+
+                <div className="setting-block">
+                  <div className="setting-row">
+                    <label htmlFor="similarity">유사도 기준</label>
+                    <output htmlFor="similarity">{activeThreshold}% 이상</output>
+                  </div>
+                  <input
+                    id="similarity"
+                    className="range"
+                    type="range"
+                    min="70"
+                    max="99"
+                    value={activeThreshold}
+                    onChange={(event) => {
+                      const nextThreshold = Number(event.target.value);
+                      if (analysisMode === "quick") setQuickThreshold(nextThreshold);
+                      else setThreshold(nextThreshold);
+                    }}
+                    disabled={isScanning}
+                  />
+                  <div className="range-labels"><span>넓게 찾기</span><span>거의 동일</span></div>
+                </div>
+              </div>
             </div>
 
-            <div className="subfolder-setting">
-              <div>
-                <strong id="subfolder-label">하위 폴더 탐색</strong>
-                <span>{includeSubfolders ? "중첩된 모든 폴더의 사진 포함" : "선택한 폴더의 사진만 포함"}</span>
+            {result && (
+              <div className="selected-period" role="status">
+                <span>선정 기간</span>
+                <strong>{formatSelectedPeriod(result.selected_date_start, result.selected_date_end)}</strong>
+                <small>{result.stats.selected_days.toLocaleString()}일, {result.stats.analyzed.toLocaleString()}장 분석</small>
               </div>
-              <div className="binary-selector" role="radiogroup" aria-labelledby="subfolder-label">
-                <button
-                  className={includeSubfolders ? "selected" : ""}
-                  role="radio"
-                  aria-checked={includeSubfolders}
-                  aria-label="하위 폴더 탐색 O"
-                  onClick={() => {
-                    setIncludeSubfolders(true);
-                    localStorage.setItem("photo-sorter-include-subfolders", "true");
-                  }}
-                  disabled={isScanning}
-                >
-                  O
-                </button>
-                <button
-                  className={!includeSubfolders ? "selected" : ""}
-                  role="radio"
-                  aria-checked={!includeSubfolders}
-                  aria-label="하위 폴더 탐색 X"
-                  onClick={() => {
-                    setIncludeSubfolders(false);
-                    localStorage.setItem("photo-sorter-include-subfolders", "false");
-                  }}
-                  disabled={isScanning}
-                >
-                  X
-                </button>
-              </div>
-            </div>
+            )}
 
-            <div className="setting-block" data-guide="threshold">
-              <div className="setting-row">
-                <label htmlFor="similarity">유사도 기준</label>
-                <output htmlFor="similarity">{activeThreshold}% 이상</output>
-              </div>
-              <input
-                id="similarity"
-                className="range"
-                type="range"
-                min="70"
-                max="99"
-                value={activeThreshold}
-                onChange={(event) => {
-                  const nextThreshold = Number(event.target.value);
-                  if (analysisMode === "quick") setQuickThreshold(nextThreshold);
-                  else setThreshold(nextThreshold);
-                }}
-                disabled={isScanning}
-              />
-              <div className="range-labels"><span>넓게 찾기</span><span>거의 동일</span></div>
-            </div>
-
-            <div className="fixed-setting">
-              <div className="fixed-setting-icon">
-                {analysisMode === "quick" ? <Lightning size={16} weight="fill" /> : <MagnifyingGlass size={16} />}
-              </div>
-              <div>
-                <strong>{analysisMode === "quick" ? `${quickThreshold}% 기준 · 빠른 추천` : "보관 여부를 직접 선택"}</strong>
-                <span>{analysisMode === "quick" ? "보관할 사진과 삭제 후보를 미리 구분" : "비슷한 사진을 모아 한눈에 비교"}</span>
-              </div>
-            </div>
-
-            <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim()} data-guide="scan">
+            <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim() || !isDayLimitValid} data-guide="scan">
               {analysisMode === "quick" ? <Lightning size={17} weight="fill" /> : <Sparkle size={17} weight="fill" />}
               {isScanning ? "분석 중" : analysisMode === "quick" ? "빠른 분석 시작" : result ? "다시 분석" : "사진 분석"}
             </button>
@@ -725,7 +985,17 @@ export function App() {
         </aside>
 
         <main className="main-content">
-          {cleanupOutcome && (!result || result.groups.length === 0) ? (
+          {storageOutcome && (!result || result.groups.length === 0) ? (
+            <StorageCompletionView
+              outcome={storageOutcome}
+              destination={destination}
+              onStartOver={() => {
+                setStorageOutcome(null);
+                setResult(null);
+                setSession(null);
+              }}
+            />
+          ) : cleanupOutcome && (!result || result.groups.length === 0) ? (
             <CompletionView outcome={cleanupOutcome} onStartOver={() => { setCleanupOutcome(null); setResult(null); setSession(null); }} />
           ) : isScanning && session ? (
             <ScanningView session={session} />
@@ -738,6 +1008,8 @@ export function App() {
               group={currentGroup}
               groupIndex={selectedGroupIndex}
               selectedPhoto={selectedPhoto}
+              keptCount={keptPhotos.length}
+              keptBytes={keptBytes}
               markedCount={markedPhotos.length}
               markedBytes={markedBytes}
               throughCurrentMarkedCount={throughCurrentMarkedPhotos.length}
@@ -750,6 +1022,8 @@ export function App() {
               onMarkAll={() => markCurrentGroup(true)}
               onKeepAll={() => markCurrentGroup(false)}
               onSwipeDecision={applySwipeDecision}
+              onStore={openStorageDialog}
+              canStore={Boolean(destination.trim()) && !isStoring}
               onTrash={() => openTrashDialog(null)}
               onTrashThrough={() => openTrashDialog(selectedGroupIndex)}
             />
@@ -775,6 +1049,17 @@ export function App() {
           loading={isTrashing}
           onCancel={() => { setIsTrashDialogOpen(false); setTrashThroughGroupIndex(null); }}
           onConfirm={trashMarked}
+        />
+      )}
+
+      {isStorageDialogOpen && (
+        <StorageDialog
+          count={keptPhotos.length}
+          bytes={keptBytes}
+          destination={destination}
+          loading={isStoring}
+          onCancel={() => setIsStorageDialogOpen(false)}
+          onConfirm={storeKeptPhotos}
         />
       )}
 
@@ -828,9 +1113,11 @@ function WelcomeView({
 
 function ScanningView({ session }: { session: Session }) {
   const progress = session.total ? Math.round((session.completed / session.total) * 100) : 0;
-  const phaseLabel = session.phase === "comparing"
-    ? session.mode === "quick" ? "매우 비슷한 사진을 찾는 중" : "비슷한 사진을 찾는 중"
-    : "사진을 살펴보는 중";
+  const phaseLabel = session.phase === "indexing"
+    ? "사진 촬영일을 확인하는 중"
+    : session.phase === "comparing"
+      ? session.mode === "quick" ? "매우 비슷한 사진을 찾는 중" : "비슷한 사진을 찾는 중"
+      : "사진을 살펴보는 중";
   return (
     <div className="scanning-view" aria-live="polite">
       <div className="scan-status-row">
@@ -840,6 +1127,12 @@ function ScanningView({ session }: { session: Session }) {
       </div>
       <div className="progress-track"><span style={{ transform: `scaleX(${progress / 100})` }} /></div>
       <p className="progress-detail">{session.completed.toLocaleString()} / {session.total.toLocaleString()} 처리</p>
+      {session.selected_date_start && session.selected_date_end && (
+        <div className="scan-period">
+          <span>선정된 분석 기간</span>
+          <strong>{formatSelectedPeriod(session.selected_date_start, session.selected_date_end)}</strong>
+        </div>
+      )}
       <div className="skeleton-comparison" aria-hidden="true">
         <div className="skeleton-card"><span /><small /></div>
         <div className="skeleton-card"><span /><small /></div>
@@ -856,6 +1149,30 @@ function EmptyResults({ result, onRescan }: { result: ScanResult; onRescan: () =
       <h1>정리할 유사 사진이 없습니다</h1>
       <p>{result.stats.source_folders.toLocaleString()}개 폴더의 사진 {result.stats.analyzed.toLocaleString()}장을 확인했지만 현재 {result.threshold}% 기준에 맞는 유사 사진을 찾지 못했습니다.</p>
       <button className="button button-secondary" onClick={onRescan}>설정을 바꿔 다시 분석</button>
+    </div>
+  );
+}
+
+function StorageCompletionView({
+  outcome,
+  destination,
+  onStartOver,
+}: {
+  outcome: StorageOutcome;
+  destination: string;
+  onStartOver: () => void;
+}) {
+  return (
+    <div className="welcome-view">
+      <div className={`welcome-icon ${outcome.failures.length ? "warning" : "success"}`}>
+        {outcome.failures.length ? <WarningCircle size={40} weight="duotone" /> : <CheckCircle size={40} weight="duotone" />}
+      </div>
+      <h1>보관 사진 {outcome.moved.length.toLocaleString()}장을 옮겼습니다</h1>
+      <p>
+        {destination}/Photos 아래에서 촬영 날짜별 폴더로 확인할 수 있습니다.
+        {outcome.failures.length ? ` ${outcome.failures.length.toLocaleString()}장은 원래 위치에 남아 있습니다.` : ""}
+      </p>
+      <button className="button button-primary" onClick={onStartOver}>새 폴더 정리</button>
     </div>
   );
 }
@@ -879,6 +1196,8 @@ type ReviewProps = {
   group: PhotoGroup;
   groupIndex: number;
   selectedPhoto: Photo;
+  keptCount: number;
+  keptBytes: number;
   markedCount: number;
   markedBytes: number;
   throughCurrentMarkedCount: number;
@@ -891,6 +1210,8 @@ type ReviewProps = {
   onMarkAll: () => void;
   onKeepAll: () => void;
   onSwipeDecision: (id: string, marked: boolean) => void;
+  onStore: () => void;
+  canStore: boolean;
   onTrash: () => void;
   onTrashThrough: () => void;
 };
@@ -973,6 +1294,16 @@ function ReviewWorkspace(props: ReviewProps) {
           <small>{formatBytes(props.mode === "quick" ? props.throughCurrentMarkedBytes : props.markedBytes)}</small>
         </div>
         <div className="review-actions">
+          <button
+            className="button button-secondary"
+            onClick={props.onStore}
+            disabled={!props.canStore || props.keptCount === 0}
+            title={props.canStore ? "보관 사진을 촬영일 폴더로 이동" : "보관 저장 위치를 먼저 선택해 주세요"}
+          >
+            <FolderOpen size={16} />
+            보관 {props.keptCount.toLocaleString()}장 이동
+            <span>{formatBytes(props.keptBytes)}</span>
+          </button>
           <button className={`button ${selectedPhoto.marked ? "button-secondary" : "button-danger-soft"}`} onClick={props.onToggleMarked}>
             {selectedPhoto.marked ? <Check size={16} weight="bold" /> : <WarningCircle size={16} weight="fill" />}
             {selectedPhoto.marked ? "후보 해제" : "후보 추가"}
@@ -1200,6 +1531,43 @@ function TrashDialog({
         <div className="modal-actions">
           <button className="button button-secondary" onClick={onCancel} disabled={loading}>취소</button>
           <button className="button button-danger" onClick={onConfirm} disabled={loading}><Trash size={16} weight="fill" />{loading ? "옮기는 중" : partial ? "여기까지 이동" : fullyMarkedGroupCount > 0 ? "전부 포함해 이동" : "휴지통으로 이동"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StorageDialog({
+  count,
+  bytes,
+  destination,
+  loading,
+  onCancel,
+  onConfirm,
+}: {
+  count: number;
+  bytes: number;
+  destination: string;
+  loading: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !loading) onCancel(); }}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="storage-title">
+        <button className="modal-close" aria-label="닫기" onClick={onCancel} disabled={loading}><X size={18} /></button>
+        <div className="modal-icon storage"><FolderOpen size={24} weight="duotone" /></div>
+        <h2 id="storage-title">보관 사진 {count.toLocaleString()}장을 옮길까요?</h2>
+        <p>
+          약 {formatBytes(bytes)}의 사진을 복사하지 않고 다음 위치로 이동합니다.
+          <strong className="storage-destination">{destination}/Photos/YYYYMMDD</strong>
+        </p>
+        <div className="safety-note"><ShieldCheck size={17} weight="fill" />촬영 날짜별 폴더를 만들며 기존 파일은 덮어쓰지 않습니다.</div>
+        <div className="modal-actions">
+          <button className="button button-secondary" onClick={onCancel} disabled={loading}>취소</button>
+          <button className="button button-primary" onClick={onConfirm} disabled={loading}>
+            <FolderOpen size={16} />{loading ? "옮기는 중" : "보관 위치로 이동"}
+          </button>
         </div>
       </div>
     </div>

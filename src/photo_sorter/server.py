@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from functools import lru_cache
+import gc
 import io
 import platform
 from pathlib import Path
@@ -19,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
-from .core import scan_folder
+from .core import clear_analysis_cache, scan_folder
+from .storage import move_selection_to_storage
 from .trash import move_selection_to_trash
 
 
@@ -33,11 +35,18 @@ class ScanRequest(BaseModel):
     time_window_seconds: int = Field(default=60, ge=1, le=3600)
     mode: Literal["standard", "quick"] = "standard"
     include_subfolders: bool = True
+    day_limit: int | None = Field(default=None, ge=1)
+    date_order: Literal["oldest", "newest"] = "oldest"
 
 
 class TrashRequest(BaseModel):
     image_ids: list[str]
     allow_delete_all: bool = False
+
+
+class StoreRequest(BaseModel):
+    image_ids: list[str]
+    destination: str = Field(min_length=1)
 
 
 @dataclass
@@ -48,6 +57,10 @@ class ScanSession:
     time_window_seconds: int
     mode: Literal["standard", "quick"] = "standard"
     include_subfolders: bool = True
+    day_limit: int | None = None
+    date_order: Literal["oldest", "newest"] = "oldest"
+    selected_date_start: str | None = None
+    selected_date_end: str | None = None
     status: str = "queued"
     phase: str = "queued"
     completed: int = 0
@@ -64,6 +77,10 @@ class ScanSession:
             "time_window_seconds": self.time_window_seconds,
             "mode": self.mode,
             "include_subfolders": self.include_subfolders,
+            "day_limit": self.day_limit,
+            "date_order": self.date_order,
+            "selected_date_start": self.selected_date_start,
+            "selected_date_end": self.selected_date_end,
             "status": self.status,
             "phase": self.phase,
             "completed": self.completed,
@@ -85,6 +102,16 @@ def _update_progress(session: ScanSession, completed: int, total: int, phase: st
         session.phase = phase
 
 
+def _update_date_range(
+    session: ScanSession,
+    selected_date_start: str | None,
+    selected_date_end: str | None,
+) -> None:
+    with sessions_lock:
+        session.selected_date_start = selected_date_start
+        session.selected_date_end = selected_date_end
+
+
 def _run_scan(session: ScanSession) -> None:
     with sessions_lock:
         session.status = "running"
@@ -96,6 +123,9 @@ def _run_scan(session: ScanSession) -> None:
             on_progress=lambda completed, total, phase: _update_progress(session, completed, total, phase),
             keeper_strategy="latest" if session.mode == "quick" else "quality",
             include_subfolders=session.include_subfolders,
+            day_limit=session.day_limit,
+            date_order=session.date_order,
+            on_date_range=lambda start, end: _update_date_range(session, start, end),
         )
         with sessions_lock:
             session.result = result
@@ -144,10 +174,39 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.post("/api/calculations/reset")
+def reset_calculations() -> dict:
+    with sessions_lock:
+        if any(session.status in {"queued", "running"} for session in sessions.values()):
+            raise HTTPException(
+                status_code=409,
+                detail="사진 분석이 끝난 뒤 계산값을 초기화해 주세요.",
+            )
+        cleared_sessions = len(sessions)
+        sessions.clear()
+
+    cleared_analysis_entries = clear_analysis_cache()
+    cleared_preview_entries = _render_image.cache_info().currsize
+    _render_image.cache_clear()
+    gc.collect()
+    return {
+        "cleared_sessions": cleared_sessions,
+        "cleared_analysis_entries": cleared_analysis_entries,
+        "cleared_preview_entries": cleared_preview_entries,
+    }
+
+
 @app.post("/api/folders/pick")
-def pick_folder() -> dict:
+def pick_folder(
+    purpose: Literal["source", "destination"] = Query(default="source"),
+) -> dict:
+    prompt = (
+        "보관 사진을 저장할 폴더를 선택하세요"
+        if purpose == "destination"
+        else "정리할 사진 폴더를 선택하세요"
+    )
     if platform.system() == "Darwin":
-        script = 'POSIX path of (choose folder with prompt "정리할 사진 폴더를 선택하세요")'
+        script = f'POSIX path of (choose folder with prompt "{prompt}")'
         completed = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True,
@@ -165,7 +224,7 @@ def pick_folder() -> dict:
 
         root = tk.Tk()
         root.withdraw()
-        path = filedialog.askdirectory(title="정리할 사진 폴더를 선택하세요")
+        path = filedialog.askdirectory(title=prompt)
         root.destroy()
         return {"path": path or None}
     except Exception as exc:
@@ -185,6 +244,8 @@ def create_scan(request: ScanRequest) -> dict:
         time_window_seconds=request.time_window_seconds,
         mode=request.mode,
         include_subfolders=request.include_subfolders,
+        day_limit=request.day_limit,
+        date_order=request.date_order,
     )
     with sessions_lock:
         sessions[session.id] = session
@@ -226,6 +287,21 @@ def trash_marked(scan_id: str, request: TrashRequest) -> dict:
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return outcome
+
+
+@app.post("/api/scans/{scan_id}/store")
+def store_kept(scan_id: str, request: StoreRequest) -> dict:
+    session = _get_session(scan_id)
+    if not session.result:
+        raise HTTPException(status_code=409, detail="사진 분석이 아직 완료되지 않았습니다.")
+    try:
+        return move_selection_to_storage(
+            session.result,
+            request.image_ids,
+            Path(request.destination),
+        )
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 if FRONTEND_DIST.is_dir():

@@ -5,6 +5,7 @@ import os
 import numpy as np
 from PIL import Image, ImageDraw
 
+from photo_sorter import core
 from photo_sorter.core import analyze_image, capture_time, discover_images, scan_folder, similarity
 
 
@@ -25,6 +26,11 @@ def save_shifted_image(path: Path, center_x: int) -> None:
     draw.ellipse((center_x - 35, 65, center_x + 35, 135), fill=(220, 80, 60))
     draw.rectangle((20, 20, 75, 55), fill=(50, 130, 210))
     image.save(path, quality=92)
+
+
+def set_modified_day(path: Path, day: int) -> None:
+    timestamp = datetime(2024, 1, day, 12).timestamp()
+    os.utime(path, (timestamp, timestamp))
 
 
 def test_capture_time_prefers_exif(tmp_path: Path) -> None:
@@ -79,12 +85,32 @@ def test_scan_excludes_unrelated_chronological_neighbors_inside_one_minute(tmp_p
     assert result["stats"]["found"] == 4
     assert result["stats"]["pairs_compared"] == 2
     assert result["stats"]["matched_pairs"] == 1
-    assert result["stats"]["groups"] == 1
+    assert result["stats"]["groups"] == 3
+    assert result["stats"]["similar_groups"] == 1
+    assert result["stats"]["singletons"] == 2
     assert [image["name"] for image in result["groups"][0]["images"]] == [
         "20240101_120000_first.jpg",
         "20240101_120040_copy.jpg",
     ]
     assert sum(image["marked"] for image in result["groups"][0]["images"]) == 1
+
+
+def test_scan_includes_unmatched_photos_as_single_photo_groups(tmp_path: Path) -> None:
+    save_image(tmp_path / "20240101_120000_blue-a.jpg", (26, 93, 142))
+    save_image(tmp_path / "20240101_120010_blue-b.jpg", (26, 93, 142))
+    save_image(tmp_path / "20240101_120020_red.jpg", (170, 48, 35))
+
+    result = scan_folder(tmp_path, threshold=88, time_window_seconds=60, max_workers=2)
+
+    assert result["stats"]["analyzed"] == 3
+    assert result["stats"]["groups"] == 2
+    assert result["stats"]["similar_groups"] == 1
+    assert result["stats"]["singletons"] == 1
+    singleton = next(group for group in result["groups"] if group["member_count"] == 1)
+    assert singleton["images"][0]["name"] == "20240101_120020_red.jpg"
+    assert singleton["keep_id"] == singleton["images"][0]["id"]
+    assert singleton["keep_ids"] == [singleton["images"][0]["id"]]
+    assert singleton["images"][0]["marked"] is False
 
 
 def test_scan_splits_visual_matches_connected_only_by_capture_time(tmp_path: Path) -> None:
@@ -158,6 +184,112 @@ def test_scan_can_exclude_nested_photo_folders(tmp_path: Path) -> None:
         "20240101_120000_root.jpg",
         "20240101_120030_root.jpg",
     ]
+
+
+def test_scan_can_limit_analysis_to_oldest_capture_days(tmp_path: Path) -> None:
+    for day in (1, 2, 3):
+        first = tmp_path / f"202401{day:02d}_120000_a.jpg"
+        second = tmp_path / f"202401{day:02d}_120030_b.jpg"
+        save_image(first, (26, 93, 142))
+        save_image(second, (26, 93, 142))
+        set_modified_day(first, day)
+        set_modified_day(second, day)
+
+    result = scan_folder(
+        tmp_path,
+        threshold=88,
+        time_window_seconds=60,
+        max_workers=2,
+        day_limit=2,
+        date_order="oldest",
+    )
+
+    assert result["day_limit"] == 2
+    assert result["date_order"] == "oldest"
+    assert result["stats"]["found"] == 6
+    assert result["stats"]["selected"] == 4
+    assert result["stats"]["available_days"] == 3
+    assert result["stats"]["selected_days"] == 2
+    assert result["stats"]["analyzed"] == 4
+    assert result["selected_date_start"] == "2024-01-01"
+    assert result["selected_date_end"] == "2024-01-02"
+    assert [group["time_start"][:10] for group in result["groups"]] == [
+        "2024-01-01",
+        "2024-01-02",
+    ]
+
+
+def test_scan_can_limit_analysis_to_newest_capture_days(tmp_path: Path) -> None:
+    for day in (1, 2, 3):
+        first = tmp_path / f"202401{day:02d}_120000_a.jpg"
+        second = tmp_path / f"202401{day:02d}_120030_b.jpg"
+        save_image(first, (26, 93, 142))
+        save_image(second, (26, 93, 142))
+        set_modified_day(first, day)
+        set_modified_day(second, day)
+
+    result = scan_folder(
+        tmp_path,
+        threshold=88,
+        time_window_seconds=60,
+        max_workers=2,
+        day_limit=2,
+        date_order="newest",
+    )
+
+    assert result["stats"]["analyzed"] == 4
+    assert result["selected_date_start"] == "2024-01-02"
+    assert result["selected_date_end"] == "2024-01-03"
+    assert [group["time_start"][:10] for group in result["groups"]] == [
+        "2024-01-02",
+        "2024-01-03",
+    ]
+
+
+def test_date_limit_fully_analyzes_only_images_from_selected_capture_days(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    oldest = tmp_path / "oldest.jpg"
+    newest = tmp_path / "newest.jpg"
+    save_image(oldest, (26, 93, 142), "2024:01:01 12:00:00")
+    save_image(newest, (26, 93, 142), "2024:01:02 12:00:00")
+    set_modified_day(oldest, 3)
+    set_modified_day(newest, 1)
+    analyzed: list[str] = []
+    original_analyze_image = core.analyze_image
+
+    def recording_analyze_image(path: Path, capture_info=None):
+        analyzed.append(path.name)
+        return original_analyze_image(path, capture_info)
+
+    monkeypatch.setattr(core, "analyze_image", recording_analyze_image)
+
+    result = scan_folder(
+        tmp_path,
+        day_limit=1,
+        date_order="oldest",
+        max_workers=2,
+    )
+
+    assert result["stats"]["found"] == 2
+    assert result["stats"]["selected"] == 1
+    assert result["selected_date_start"] == "2024-01-01"
+    assert result["selected_date_end"] == "2024-01-01"
+    assert analyzed == [oldest.name]
+
+
+def test_clear_analysis_cache_discards_cached_records(tmp_path: Path) -> None:
+    path = tmp_path / "20240101_120000.jpg"
+    save_image(path, (26, 93, 142))
+    first = analyze_image(path)
+    assert analyze_image(path) is first
+
+    cleared = core.clear_analysis_cache()
+    second = analyze_image(path)
+
+    assert cleared >= 1
+    assert second is not first
 
 
 def test_one_minute_chain_forms_one_five_photo_group(tmp_path: Path) -> None:

@@ -1,5 +1,7 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from photo_sorter import server
 
 
@@ -33,11 +35,23 @@ def test_scan_preserves_subfolder_choice(tmp_path: Path, monkeypatch) -> None:
     server.sessions.pop(payload["id"], None)
 
 
+def test_scan_preserves_date_limit_and_order(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    request = server.ScanRequest(folder=str(tmp_path), day_limit=12, date_order="newest")
+
+    payload = server.create_scan(request)
+
+    assert payload["day_limit"] == 12
+    assert payload["date_order"] == "newest"
+    server.sessions.pop(payload["id"], None)
+
+
 def test_scan_worker_passes_subfolder_choice(tmp_path: Path, monkeypatch) -> None:
     received: dict = {}
 
     def fake_scan(folder: Path, **kwargs) -> dict:
         received.update(kwargs)
+        kwargs["on_date_range"]("2024-01-03", "2024-01-09")
         return {"groups": []}
 
     monkeypatch.setattr(server, "scan_folder", fake_scan)
@@ -47,9 +61,101 @@ def test_scan_worker_passes_subfolder_choice(tmp_path: Path, monkeypatch) -> Non
         threshold=88,
         time_window_seconds=60,
         include_subfolders=False,
+        day_limit=7,
+        date_order="newest",
     )
 
     server._run_scan(session)
 
     assert received["include_subfolders"] is False
+    assert received["day_limit"] == 7
+    assert received["date_order"] == "newest"
+    assert session.selected_date_start == "2024-01-03"
+    assert session.selected_date_end == "2024-01-09"
     assert session.status == "complete"
+
+
+def test_reset_calculations_clears_sessions_and_caches(monkeypatch) -> None:
+    session = server.ScanSession(
+        id="completed-scan",
+        folder="/tmp/photos",
+        threshold=88,
+        time_window_seconds=60,
+        status="complete",
+        result={"groups": []},
+    )
+    server.sessions[session.id] = session
+    preview_cache_cleared = False
+
+    def clear_preview_cache() -> None:
+        nonlocal preview_cache_cleared
+        preview_cache_cleared = True
+
+    monkeypatch.setattr(server, "clear_analysis_cache", lambda: 7)
+    monkeypatch.setattr(server._render_image, "cache_info", lambda: SimpleNamespace(currsize=3))
+    monkeypatch.setattr(server._render_image, "cache_clear", clear_preview_cache)
+    monkeypatch.setattr(server.gc, "collect", lambda: 0)
+
+    result = server.reset_calculations()
+
+    assert result == {
+        "cleared_sessions": 1,
+        "cleared_analysis_entries": 7,
+        "cleared_preview_entries": 3,
+    }
+    assert preview_cache_cleared is True
+    assert server.sessions == {}
+
+
+def test_reset_calculations_rejects_running_scan() -> None:
+    session = server.ScanSession(
+        id="running-scan",
+        folder="/tmp/photos",
+        threshold=88,
+        time_window_seconds=60,
+        status="running",
+    )
+    server.sessions[session.id] = session
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server.reset_calculations()
+
+    assert exc_info.value.status_code == 409
+    server.sessions.pop(session.id, None)
+
+
+def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch) -> None:
+    session = server.ScanSession(
+        id="storage-scan",
+        folder=str(tmp_path),
+        threshold=88,
+        time_window_seconds=60,
+        status="complete",
+        result={"folder": str(tmp_path), "groups": []},
+    )
+    server.sessions[session.id] = session
+    received: dict = {}
+
+    def fake_store(result: dict, image_ids: list[str], destination: Path) -> dict:
+        received.update(
+            result=result,
+            image_ids=image_ids,
+            destination=destination,
+        )
+        return {"moved": [], "failures": []}
+
+    monkeypatch.setattr(server, "move_selection_to_storage", fake_store)
+
+    outcome = server.store_kept(
+        session.id,
+        server.StoreRequest(
+            image_ids=["photo-1"],
+            destination=str(tmp_path / "archive"),
+        ),
+    )
+
+    assert outcome == {"moved": [], "failures": []}
+    assert received["result"] is session.result
+    assert received["image_ids"] == ["photo-1"]
+    assert received["destination"] == tmp_path / "archive"
+    server.sessions.pop(session.id, None)
