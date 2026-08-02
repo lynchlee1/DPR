@@ -49,6 +49,29 @@ def test_macos_folder_picker_can_select_multiple_folders_at_once(monkeypatch) ->
     }
 
 
+def test_browse_folders_lists_visible_directories(tmp_path: Path) -> None:
+    (tmp_path / "Camera").mkdir()
+    (tmp_path / "phone").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "notes.txt").write_text("not a folder")
+
+    result = server.browse_folders(str(tmp_path))
+
+    assert result["path"] == str(tmp_path.resolve())
+    assert result["parent"] == str(tmp_path.resolve().parent)
+    assert result["folders"] == [
+        {"name": "Camera", "path": str((tmp_path / "Camera").resolve())},
+        {"name": "phone", "path": str((tmp_path / "phone").resolve())},
+    ]
+
+
+def test_browse_folders_rejects_missing_directory(tmp_path: Path) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        server.browse_folders(str(tmp_path / "missing"))
+
+    assert exc_info.value.status_code == 400
+
+
 def test_quick_scan_respects_requested_threshold(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(server.threading, "Thread", DeferredThread)
     request = server.ScanRequest(folder=str(tmp_path), threshold=91, mode="quick")
