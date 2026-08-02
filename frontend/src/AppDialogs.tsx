@@ -17,12 +17,18 @@ export function FolderBrowserDialog({
   const [loading, setLoading] = useState(true);
   const [browseError, setBrowseError] = useState<string | null>(null);
 
-  async function loadFolder(path?: string): Promise<boolean> {
+  async function loadFolder(path?: string, reveal = false): Promise<boolean> {
     setLoading(true);
     setBrowseError(null);
     try {
-      const query = path ? `?path=${encodeURIComponent(path)}` : "";
-      setBrowser(await api<FolderBrowserData>(`/api/folders/browse${query}`));
+      const query = path ? `?${reveal ? "reveal" : "path"}=${encodeURIComponent(path)}` : "";
+      const nextBrowser = await api<FolderBrowserData>(`/api/folders/browse${query}`);
+      setBrowser(nextBrowser);
+      if (reveal && nextBrowser.revealed && path !== nextBrowser.revealed) {
+        setSelected((previous) => [
+          ...new Set(previous.map((item) => item === path ? nextBrowser.revealed! : item)),
+        ]);
+      }
       return true;
     } catch (loadError) {
       setBrowseError(loadError instanceof Error ? loadError.message : "폴더를 열지 못했습니다.");
@@ -34,7 +40,7 @@ export function FolderBrowserDialog({
 
   useEffect(() => {
     void (async () => {
-      if (!await loadFolder(initialSelected[0])) await loadFolder();
+      if (!await loadFolder(initialSelected[0], true)) await loadFolder();
     })();
   }, []);
 

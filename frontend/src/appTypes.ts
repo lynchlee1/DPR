@@ -131,6 +131,7 @@ export type CalculationCache = {
 export type FolderBrowserData = {
   path: string;
   parent: string | null;
+  revealed?: string | null;
   folders: { name: string; path: string }[];
   shortcuts: { name: string; path: string }[];
 };

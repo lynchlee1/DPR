@@ -72,6 +72,22 @@ def test_browse_folders_rejects_missing_directory(tmp_path: Path) -> None:
     assert exc_info.value.status_code == 400
 
 
+def test_browse_folders_reveals_existing_selection_first(tmp_path: Path) -> None:
+    selected = tmp_path / "Selected photos"
+    other = tmp_path / "Archive"
+    selected.mkdir()
+    other.mkdir()
+
+    result = server.browse_folders(reveal=str(selected))
+
+    assert result["path"] == str(tmp_path.resolve())
+    assert result["revealed"] == str(selected.resolve())
+    assert result["folders"][0] == {
+        "name": "Selected photos",
+        "path": str(selected.resolve()),
+    }
+
+
 def test_quick_scan_respects_requested_threshold(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(server.threading, "Thread", DeferredThread)
     request = server.ScanRequest(folder=str(tmp_path), threshold=91, mode="quick")

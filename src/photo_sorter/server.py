@@ -114,7 +114,7 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.1.1")
+app = FastAPI(title="사진 정리", version="1.1.2")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
@@ -425,8 +425,12 @@ def pick_folder(
 
 
 @app.get("/api/folders/browse")
-def browse_folders(path: str | None = Query(default=None)) -> dict:
-    target = Path(path).expanduser().resolve() if path else Path.home().resolve()
+def browse_folders(
+    path: str | None = None,
+    reveal: str | None = None,
+) -> dict:
+    revealed_path = Path(reveal).expanduser().resolve() if reveal else None
+    target = revealed_path.parent if revealed_path else Path(path).expanduser().resolve() if path else Path.home().resolve()
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="존재하는 폴더를 열어 주세요.")
 
@@ -437,7 +441,7 @@ def browse_folders(path: str | None = Query(default=None)) -> dict:
                 for child in target.iterdir()
                 if child.is_dir() and not child.name.startswith(".")
             ),
-            key=lambda item: item["name"].casefold(),
+            key=lambda item: (item["path"] != str(revealed_path), item["name"].casefold()),
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="이 폴더를 열 권한이 없습니다.") from exc
@@ -460,6 +464,7 @@ def browse_folders(path: str | None = Query(default=None)) -> dict:
     return {
         "path": str(target),
         "parent": str(parent) if parent != target else None,
+        "revealed": str(revealed_path) if revealed_path else None,
         "folders": folders,
         "shortcuts": shortcuts,
     }
