@@ -37,8 +37,6 @@ def validate_trash_selection(
             path.relative_to(root)
         except ValueError as exc:
             raise ValueError("선택한 폴더 밖의 파일은 이동할 수 없습니다.") from exc
-        if not path.is_file():
-            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {path.name}")
         paths.append(path)
     return sorted(paths, key=lambda path: str(path).casefold())
 
@@ -58,6 +56,11 @@ def move_selection_to_trash(
     moved: list[str] = []
     failures: list[dict[str, str]] = []
     for path in paths:
+        if not path.is_file():
+            failures.append(
+                {"path": str(path), "reason": f"파일을 찾을 수 없습니다: {path.name}"}
+            )
+            continue
         try:
             mover(str(path))
             moved.append(str(path))

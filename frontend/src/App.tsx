@@ -31,6 +31,9 @@ const DEFAULT_QUICK_THRESHOLD = 96;
 const SETUP_GUIDE_KEY = "photo-sorter-setup-guide-v1";
 const REVIEW_GUIDE_KEY = "photo-sorter-review-guide-v1";
 const SHOW_SINGLETONS_KEY = "photo-sorter-show-singletons";
+const CLEANUP_JSON_KEY = "photo-sorter-cleanup-json";
+const ARROW_REPEAT_INTERVAL_KEY = "photo-sorter-arrow-repeat-interval";
+const DEFAULT_ARROW_REPEAT_INTERVAL = 250;
 
 type Photo = {
   id: string;
@@ -39,6 +42,7 @@ type Photo = {
   relative_path: string;
   captured_at: string;
   time_source: "exif" | "filename" | "modified";
+  media_type: "image" | "video";
   width: number;
   height: number;
   size_bytes: number;
@@ -68,6 +72,7 @@ type ScanResult = {
   time_window_seconds: number;
   keeper_strategy: "quality" | "latest";
   include_subfolders: boolean;
+  cleanup_json_files: boolean;
   day_limit: number | null;
   date_order: DateOrder;
   selected_date_start: string | null;
@@ -81,6 +86,8 @@ type ScanResult = {
     available_days: number;
     selected_days: number;
     analyzed: number;
+    videos: number;
+    json_files_deleted: number;
     pairs_compared: number;
     matched_pairs: number;
     groups: number;
@@ -99,6 +106,7 @@ type Session = {
   time_window_seconds: number;
   mode: AnalysisMode;
   include_subfolders: boolean;
+  cleanup_json_files: boolean;
   day_limit: number | null;
   date_order: DateOrder;
   selected_date_start: string | null;
@@ -192,7 +200,8 @@ function firstReviewPhoto(group: PhotoGroup | undefined): Photo | undefined {
 }
 
 function filterReviewGroups(groups: PhotoGroup[], showSingletons: boolean): PhotoGroup[] {
-  return showSingletons ? groups : groups.filter((group) => group.images.length > 1);
+  const photoGroups = groups.filter((group) => group.images.every((image) => image.media_type === "image"));
+  return showSingletons ? photoGroups : photoGroups.filter((group) => group.images.length > 1);
 }
 
 function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult {
@@ -254,6 +263,9 @@ export function App() {
   const [includeSubfolders, setIncludeSubfolders] = useState(
     () => localStorage.getItem("photo-sorter-include-subfolders") !== "false",
   );
+  const [cleanupJsonFiles, setCleanupJsonFiles] = useState(
+    () => localStorage.getItem(CLEANUP_JSON_KEY) === "true",
+  );
   const [dayLimit, setDayLimit] = useState(() => localStorage.getItem("photo-sorter-day-limit") || "");
   const [dateOrder, setDateOrder] = useState<DateOrder>(
     () => localStorage.getItem("photo-sorter-date-order") === "newest" ? "newest" : "oldest",
@@ -261,6 +273,12 @@ export function App() {
   const [showSingletons, setShowSingletons] = useState(
     () => localStorage.getItem(SHOW_SINGLETONS_KEY) !== "false",
   );
+  const [arrowRepeatInterval, setArrowRepeatInterval] = useState(() => {
+    const stored = Number(localStorage.getItem(ARROW_REPEAT_INTERVAL_KEY));
+    return Number.isFinite(stored) && stored >= 100 && stored <= 1000
+      ? stored
+      : DEFAULT_ARROW_REPEAT_INTERVAL;
+  });
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
@@ -282,6 +300,7 @@ export function App() {
     localStorage.getItem(SETUP_GUIDE_KEY) ? null : { kind: "setup", step: 0 },
   );
   const helpButtonRef = useRef<HTMLButtonElement>(null);
+  const lastArrowNavigationAtRef = useRef(0);
 
   const isScanning = session?.status === "queued" || session?.status === "running";
   const visibleGroups = useMemo(
@@ -299,9 +318,16 @@ export function App() {
     [visibleGroups],
   );
   const keptPhotos = useMemo(
-    () => visibleGroups.flatMap((group) => group.images).filter((image) => !image.marked),
-    [visibleGroups],
+    () => (result?.groups ?? []).flatMap((group) => group.images).filter((image) => !image.marked),
+    [result],
   );
+  const hiddenVideos = useMemo(
+    () => (result?.groups ?? []).flatMap((group) => group.images).filter((image) => image.media_type === "video"),
+    [result],
+  );
+  const hiddenSingletonPhotoCount = (result?.groups ?? []).filter(
+    (group) => group.images.length === 1 && group.images[0].media_type === "image",
+  ).length;
   const markedBytes = markedPhotos.reduce((total, image) => total + image.size_bytes, 0);
   const keptBytes = keptPhotos.reduce((total, image) => total + image.size_bytes, 0);
   const groupsInTrashScope = visibleGroups.length
@@ -324,6 +350,8 @@ export function App() {
     : [
         includeSubfolders ? "하위 폴더 포함" : "현재 폴더만",
         showSingletons ? "단독 사진 표시" : "단독 사진 숨김",
+        cleanupJsonFiles ? "JSON 청소" : "JSON 유지",
+        `방향키 ${arrowRepeatInterval}ms`,
         dayLimit ? `${dateOrder === "oldest" ? "오래된 날부터" : "최신 날부터"} ${dayLimit}일` : "전체 기간",
         `유사도 ${activeThreshold}%`,
       ].join(", ");
@@ -377,7 +405,8 @@ export function App() {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (!result || isTrashDialogOpen || isStorageDialogOpen || guide) return;
-      if (event.repeat) return;
+      const isArrowNavigation = event.key === "ArrowRight" || event.key === "ArrowLeft";
+      if (event.repeat && !isArrowNavigation) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
       const key = event.key.toLowerCase();
@@ -405,8 +434,11 @@ export function App() {
         if (key === "s" && selectedPhoto) setPhotoMarked(selectedPhoto.id, false);
         return;
       }
-      if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      if (isArrowNavigation) {
         event.preventDefault();
+        const now = performance.now();
+        if (event.repeat && now - lastArrowNavigationAtRef.current < arrowRepeatInterval) return;
+        lastArrowNavigationAtRef.current = now;
         selectGroup(
           event.key === "ArrowRight"
             ? Math.min(selectedGroupIndex + 1, visibleGroups.length - 1)
@@ -503,6 +535,7 @@ export function App() {
           time_window_seconds: 60,
           mode: analysisMode,
           include_subfolders: includeSubfolders,
+          cleanup_json_files: cleanupJsonFiles,
           day_limit: dayLimit === "" ? null : Number(dayLimit),
           date_order: dateOrder,
         }),
@@ -909,6 +942,41 @@ export function App() {
 
                 <div className="binary-setting">
                   <div>
+                    <strong id="json-cleanup-label">JSON 파일 청소</strong>
+                    <span>{cleanupJsonFiles ? "분석 시작 시 검사 경로의 JSON 파일 삭제" : "JSON 파일을 그대로 유지"}</span>
+                  </div>
+                  <div className="binary-selector" role="radiogroup" aria-labelledby="json-cleanup-label">
+                    <button
+                      className={cleanupJsonFiles ? "selected" : ""}
+                      role="radio"
+                      aria-checked={cleanupJsonFiles}
+                      aria-label="JSON 파일 청소 O"
+                      onClick={() => {
+                        setCleanupJsonFiles(true);
+                        localStorage.setItem(CLEANUP_JSON_KEY, "true");
+                      }}
+                      disabled={isScanning}
+                    >
+                      O
+                    </button>
+                    <button
+                      className={!cleanupJsonFiles ? "selected" : ""}
+                      role="radio"
+                      aria-checked={!cleanupJsonFiles}
+                      aria-label="JSON 파일 청소 X"
+                      onClick={() => {
+                        setCleanupJsonFiles(false);
+                        localStorage.setItem(CLEANUP_JSON_KEY, "false");
+                      }}
+                      disabled={isScanning}
+                    >
+                      X
+                    </button>
+                  </div>
+                </div>
+
+                <div className="binary-setting">
+                  <div>
                     <strong id="singleton-visibility-label">단독 사진 표시</strong>
                     <span>{showSingletons ? "1장짜리 그룹을 함께 표시" : "유사 사진 그룹만 표시"}</span>
                   </div>
@@ -989,6 +1057,28 @@ export function App() {
 
                 <div className="setting-block">
                   <div className="setting-row">
+                    <label htmlFor="arrow-repeat-interval">방향키 연속 이동 속도</label>
+                    <output htmlFor="arrow-repeat-interval">{arrowRepeatInterval}ms/그룹</output>
+                  </div>
+                  <input
+                    id="arrow-repeat-interval"
+                    className="range"
+                    type="range"
+                    min="100"
+                    max="1000"
+                    step="50"
+                    value={arrowRepeatInterval}
+                    onChange={(event) => {
+                      const interval = Number(event.target.value);
+                      setArrowRepeatInterval(interval);
+                      localStorage.setItem(ARROW_REPEAT_INTERVAL_KEY, String(interval));
+                    }}
+                  />
+                  <div className="range-labels"><span>빠르게</span><span>천천히</span></div>
+                </div>
+
+                <div className="setting-block">
+                  <div className="setting-row">
                     <label htmlFor="similarity">유사도 기준</label>
                     <output htmlFor="similarity">{activeThreshold}% 이상</output>
                   </div>
@@ -1015,7 +1105,10 @@ export function App() {
               <div className="selected-period" role="status">
                 <span>선정 기간</span>
                 <strong>{formatSelectedPeriod(result.selected_date_start, result.selected_date_end)}</strong>
-                <small>{result.stats.selected_days.toLocaleString()}일, {result.stats.analyzed.toLocaleString()}장 분석</small>
+                <small>
+                  {result.stats.selected_days.toLocaleString()}일, {result.stats.analyzed.toLocaleString()}개 파일 분석
+                  {result.stats.json_files_deleted > 0 ? ` · JSON ${result.stats.json_files_deleted.toLocaleString()}개 삭제` : ""}
+                </small>
               </div>
             )}
 
@@ -1078,9 +1171,23 @@ export function App() {
             <ScanningView session={session} />
           ) : result && result.groups.length === 0 ? (
             <EmptyResults result={result} onRescan={startScan} />
+          ) : result && visibleGroups.length === 0 && hiddenVideos.length > 0 ? (
+            <HiddenVideosView
+              count={hiddenVideos.length}
+              hiddenSingletonPhotoCount={showSingletons ? 0 : hiddenSingletonPhotoCount}
+              keptCount={keptPhotos.length}
+              keptBytes={keptBytes}
+              canStore={Boolean(destination.trim()) && !isStoring}
+              onStore={openStorageDialog}
+              onShowSingletons={() => updateSingletonVisibility(true)}
+            />
           ) : result && visibleGroups.length === 0 ? (
             <HiddenSingletonsView
-              count={result.groups.filter((group) => group.images.length === 1).length}
+              count={hiddenSingletonPhotoCount}
+              keptCount={keptPhotos.length}
+              keptBytes={keptBytes}
+              canStore={Boolean(destination.trim()) && !isStoring}
+              onStore={openStorageDialog}
               onShow={() => updateSingletonVisibility(true)}
             />
           ) : result && currentGroup && selectedPhoto && session ? (
@@ -1235,16 +1342,83 @@ function EmptyResults({ result, onRescan }: { result: ScanResult; onRescan: () =
   );
 }
 
-function HiddenSingletonsView({ count, onShow }: { count: number; onShow: () => void }) {
+function HiddenVideosView({
+  count,
+  hiddenSingletonPhotoCount,
+  keptCount,
+  keptBytes,
+  canStore,
+  onStore,
+  onShowSingletons,
+}: {
+  count: number;
+  hiddenSingletonPhotoCount: number;
+  keptCount: number;
+  keptBytes: number;
+  canStore: boolean;
+  onStore: () => void;
+  onShowSingletons: () => void;
+}) {
+  return (
+    <div className="welcome-view">
+      <div className="welcome-icon success"><CheckCircle size={40} weight="duotone" /></div>
+      <h1>사진 미리보기가 모두 끝났습니다</h1>
+      <p>
+        영상 {count.toLocaleString()}개는 미리보기에 표시하지 않으며, 보관하면 촬영일 폴더로 함께 이동합니다.
+      </p>
+      <div className="welcome-actions">
+        {hiddenSingletonPhotoCount > 0 && (
+          <button className="button button-secondary" onClick={onShowSingletons}>
+            단독 사진 {hiddenSingletonPhotoCount.toLocaleString()}장 표시
+          </button>
+        )}
+        <button
+          className="button button-primary"
+          onClick={onStore}
+          disabled={!canStore || keptCount === 0}
+          title={canStore ? "보관 파일을 촬영일 폴더로 이동" : "보관 저장 위치를 먼저 선택해 주세요"}
+        >
+          <FolderOpen size={16} />보관 {keptCount.toLocaleString()}개 이동 <span>{formatBytes(keptBytes)}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HiddenSingletonsView({
+  count,
+  keptCount,
+  keptBytes,
+  canStore,
+  onStore,
+  onShow,
+}: {
+  count: number;
+  keptCount: number;
+  keptBytes: number;
+  canStore: boolean;
+  onStore: () => void;
+  onShow: () => void;
+}) {
   return (
     <div className="welcome-view">
       <div className="welcome-icon"><ImageSquare size={40} weight="duotone" /></div>
       <h1>단독 사진을 숨겼습니다</h1>
       <p>
         현재 표시할 유사 사진 그룹이 없습니다. 숨겨진 단독 사진 {count.toLocaleString()}장은
-        언제든 다시 표시할 수 있습니다.
+        보관 이동 대상에 계속 포함되며 언제든 다시 표시할 수 있습니다.
       </p>
-      <button className="button button-secondary" onClick={onShow}>단독 사진 표시</button>
+      <div className="welcome-actions">
+        <button className="button button-secondary" onClick={onShow}>단독 사진 표시</button>
+        <button
+          className="button button-primary"
+          onClick={onStore}
+          disabled={!canStore || keptCount === 0}
+          title={canStore ? "보관 사진을 촬영일 폴더로 이동" : "보관 저장 위치를 먼저 선택해 주세요"}
+        >
+          <FolderOpen size={16} />보관 {keptCount.toLocaleString()}장 이동 <span>{formatBytes(keptBytes)}</span>
+        </button>
+      </div>
     </div>
   );
 }

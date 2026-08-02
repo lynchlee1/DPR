@@ -44,6 +44,7 @@ class ScanRequest(BaseModel):
     include_subfolders: bool = True
     day_limit: int | None = Field(default=None, ge=1)
     date_order: Literal["oldest", "newest"] = "oldest"
+    cleanup_json_files: bool = False
 
 
 class TrashRequest(BaseModel):
@@ -66,6 +67,7 @@ class ScanSession:
     include_subfolders: bool = True
     day_limit: int | None = None
     date_order: Literal["oldest", "newest"] = "oldest"
+    cleanup_json_files: bool = False
     selected_date_start: str | None = None
     selected_date_end: str | None = None
     status: str = "queued"
@@ -86,6 +88,7 @@ class ScanSession:
             "include_subfolders": self.include_subfolders,
             "day_limit": self.day_limit,
             "date_order": self.date_order,
+            "cleanup_json_files": self.cleanup_json_files,
             "selected_date_start": self.selected_date_start,
             "selected_date_end": self.selected_date_end,
             "status": self.status,
@@ -97,7 +100,7 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.0.0")
+app = FastAPI(title="사진 정리", version="1.0.1")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
@@ -137,6 +140,7 @@ def _run_scan(session: ScanSession) -> None:
             day_limit=session.day_limit,
             date_order=session.date_order,
             on_date_range=lambda start, end: _update_date_range(session, start, end),
+            cleanup_json_files=session.cleanup_json_files,
         )
         with sessions_lock:
             session.result = result
@@ -258,6 +262,7 @@ def create_scan(request: ScanRequest) -> dict:
         include_subfolders=request.include_subfolders,
         day_limit=request.day_limit,
         date_order=request.date_order,
+        cleanup_json_files=request.cleanup_json_files,
     )
     with sessions_lock:
         sessions[session.id] = session

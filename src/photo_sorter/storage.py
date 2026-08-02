@@ -47,8 +47,6 @@ def validate_storage_selection(
             path.relative_to(root)
         except ValueError as exc:
             raise ValueError("선택한 폴더 밖의 파일은 이동할 수 없습니다.") from exc
-        if not path.is_file():
-            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {path.name}")
         images.append((image, path))
 
     images.sort(key=lambda item: str(item[1]).casefold())
@@ -93,6 +91,11 @@ def move_selection_to_storage(
     planned: list[tuple[Path, Path]] = []
 
     for image, source in images:
+        if not source.is_file():
+            failures.append(
+                {"path": str(source), "reason": f"파일을 찾을 수 없습니다: {source.name}"}
+            )
+            continue
         try:
             captured_at = datetime.fromisoformat(image["captured_at"])
             target_folder = destination / "Photos" / captured_at.strftime("%Y%m%d")
@@ -120,6 +123,7 @@ def move_selection_to_storage(
                 source, expected_target
             ):
                 target = expected_target
+                expected_target.unlink()
                 mover(str(source), str(target))
             else:
                 target = _unique_destination(expected_target)

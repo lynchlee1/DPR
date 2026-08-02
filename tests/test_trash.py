@@ -104,3 +104,27 @@ def test_nested_photo_is_a_valid_trash_target(tmp_path: Path) -> None:
 
     assert outcome == {"moved": [str(nested_photo)], "failures": []}
     assert moved == [str(nested_photo)]
+
+
+def test_missing_file_does_not_stop_other_trash_moves(tmp_path: Path) -> None:
+    result = make_result(tmp_path)
+    (tmp_path / "first.jpg").unlink()
+    moved: list[str] = []
+
+    outcome = move_selection_to_trash(
+        result,
+        ["first", "second"],
+        allow_delete_all=True,
+        mover=moved.append,
+    )
+
+    assert moved == [str(tmp_path / "second.jpg")]
+    assert outcome == {
+        "moved": [str(tmp_path / "second.jpg")],
+        "failures": [
+            {
+                "path": str(tmp_path / "first.jpg"),
+                "reason": "파일을 찾을 수 없습니다: first.jpg",
+            }
+        ],
+    }

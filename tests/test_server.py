@@ -35,6 +35,16 @@ def test_scan_preserves_subfolder_choice(tmp_path: Path, monkeypatch) -> None:
     server.sessions.pop(payload["id"], None)
 
 
+def test_scan_preserves_json_cleanup_choice(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    request = server.ScanRequest(folder=str(tmp_path), cleanup_json_files=True)
+
+    payload = server.create_scan(request)
+
+    assert payload["cleanup_json_files"] is True
+    server.sessions.pop(payload["id"], None)
+
+
 def test_scan_preserves_date_limit_and_order(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(server.threading, "Thread", DeferredThread)
     request = server.ScanRequest(folder=str(tmp_path), day_limit=12, date_order="newest")
@@ -70,6 +80,7 @@ def test_scan_worker_passes_subfolder_choice(tmp_path: Path, monkeypatch) -> Non
     assert received["include_subfolders"] is False
     assert received["day_limit"] == 7
     assert received["date_order"] == "newest"
+    assert received["cleanup_json_files"] is False
     assert session.selected_date_start == "2024-01-03"
     assert session.selected_date_end == "2024-01-09"
     assert session.status == "complete"

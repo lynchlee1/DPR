@@ -133,6 +133,63 @@ def test_existing_file_with_same_hash_is_overwritten(
     assert not (target_folder / "first (1).jpg").exists()
 
 
+def test_video_name_collision_uses_hash_only_for_overwrite_decision(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    video = source / "clip.mp4"
+    video.write_bytes(b"new video")
+    result = {
+        "folder": str(source),
+        "groups": [{"images": [{
+            "id": "video",
+            "path": str(video),
+            "captured_at": "2024-06-07T08:09:10",
+        }]}],
+    }
+    target_folder = destination / "Photos" / "20240607"
+    target_folder.mkdir(parents=True)
+    existing = target_folder / "clip.mp4"
+    existing.write_bytes(b"different video")
+
+    outcome = move_selection_to_storage(result, ["video"], destination)
+
+    renamed = target_folder / "clip (1).mp4"
+    assert outcome["failures"] == []
+    assert outcome["moved"] == [{"source": str(video), "destination": str(renamed)}]
+    assert existing.read_bytes() == b"different video"
+    assert renamed.read_bytes() == b"new video"
+
+
+def test_video_with_same_hash_overwrites_existing_name(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    video = source / "clip.mp4"
+    video.write_bytes(b"same video")
+    result = {
+        "folder": str(source),
+        "groups": [{"images": [{
+            "id": "video",
+            "path": str(video),
+            "captured_at": "2024-06-07T08:09:10",
+        }]}],
+    }
+    existing = destination / "Photos" / "20240607" / "clip.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"same video")
+
+    outcome = move_selection_to_storage(result, ["video"], destination)
+
+    assert outcome["failures"] == []
+    assert outcome["moved"] == [{"source": str(video), "destination": str(existing)}]
+    assert not video.exists()
+    assert existing.read_bytes() == b"same video"
+    assert not (existing.parent / "clip (1).mp4").exists()
+
+
 def test_kept_photo_can_be_stored_after_candidate_moves_to_trash(tmp_path: Path) -> None:
     source = tmp_path / "source"
     destination = tmp_path / "archive"
@@ -222,6 +279,31 @@ def test_move_failure_reports_source_destination_and_reason(tmp_path: Path) -> N
         }
     ]
     assert (source / "first.jpg").is_file()
+
+
+def test_missing_file_does_not_stop_other_storage_moves(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    result = make_result(source)
+    (source / "first.jpg").unlink()
+
+    outcome = move_selection_to_storage(result, ["first", "second"], destination)
+
+    assert outcome["moved"] == [
+        {
+            "source": str(source / "second.jpg"),
+            "destination": str(destination / "Photos" / "20240304" / "second.jpg"),
+        }
+    ]
+    assert outcome["failures"] == [
+        {
+            "path": str(source / "first.jpg"),
+            "reason": "파일을 찾을 수 없습니다: first.jpg",
+        }
+    ]
+    assert (destination / "Photos" / "20240304" / "second.jpg").read_bytes() == b"second"
 
 
 def test_cross_filesystem_move_does_not_copy_unsupported_metadata(

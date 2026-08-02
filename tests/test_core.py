@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from photo_sorter import core
-from photo_sorter.core import analyze_image, capture_time, discover_images, scan_folder, similarity
+from photo_sorter.core import analyze_image, capture_time, discover_images, discover_videos, scan_folder, similarity
 
 
 def save_image(path: Path, color: tuple[int, int, int], exif_time: str | None = None) -> None:
@@ -184,6 +184,46 @@ def test_scan_can_exclude_nested_photo_folders(tmp_path: Path) -> None:
         "20240101_120000_root.jpg",
         "20240101_120030_root.jpg",
     ]
+
+
+def test_scan_keeps_videos_as_independent_items_without_similarity_check(tmp_path: Path) -> None:
+    first = tmp_path / "20240101_120000_clip.mp4"
+    second = tmp_path / "20240101_120001_clip.mov"
+    first.write_bytes(b"first video")
+    second.write_bytes(b"second video")
+
+    result = scan_folder(tmp_path, max_workers=2)
+
+    assert discover_videos(tmp_path) == [first, second]
+    assert result["stats"]["found"] == 2
+    assert result["stats"]["videos"] == 2
+    assert result["stats"]["pairs_compared"] == 0
+    assert [group["member_count"] for group in result["groups"]] == [1, 1]
+    assert [group["images"][0]["media_type"] for group in result["groups"]] == ["video", "video"]
+    assert all(not group["images"][0]["marked"] for group in result["groups"])
+
+
+def test_scan_json_cleanup_respects_setting_and_subfolder_scope(tmp_path: Path) -> None:
+    root_json = tmp_path / "metadata.JSON"
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    nested_json = nested / "sidecar.json"
+    root_json.write_text("{}")
+    nested_json.write_text("{}")
+
+    preserved = scan_folder(tmp_path, cleanup_json_files=False, max_workers=2)
+    assert preserved["stats"]["json_files_deleted"] == 0
+    assert root_json.exists() and nested_json.exists()
+
+    cleaned = scan_folder(
+        tmp_path,
+        cleanup_json_files=True,
+        include_subfolders=False,
+        max_workers=2,
+    )
+    assert cleaned["stats"]["json_files_deleted"] == 1
+    assert not root_json.exists()
+    assert nested_json.exists()
 
 
 def test_scan_can_limit_analysis_to_oldest_capture_days(tmp_path: Path) -> None:

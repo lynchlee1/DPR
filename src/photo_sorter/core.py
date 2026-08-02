@@ -18,6 +18,17 @@ from PIL import Image, ImageOps
 
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
+SUPPORTED_VIDEO_EXTENSIONS = {
+    ".3gp",
+    ".avi",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".webm",
+}
 EXIF_TIME_KEYS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, DateTime
 ProgressCallback = Callable[[int, int, str], None]
 DateRangeCallback = Callable[[str | None, str | None], None]
@@ -57,6 +68,38 @@ def discover_images(folder: Path, include_subfolders: bool = True) -> list[Path]
         ),
         key=lambda path: str(path).casefold(),
     )
+
+
+def discover_videos(folder: Path, include_subfolders: bool = True) -> list[Path]:
+    candidates = folder.rglob("*") if include_subfolders else folder.iterdir()
+    return sorted(
+        (
+            path
+            for path in candidates
+            if path.is_file() and path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
+        ),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def delete_json_files(
+    folder: Path,
+    include_subfolders: bool = True,
+) -> tuple[int, list[dict[str, str]]]:
+    candidates = folder.rglob("*") if include_subfolders else folder.iterdir()
+    paths = sorted(
+        (path for path in candidates if path.is_file() and path.suffix.lower() == ".json"),
+        key=lambda path: str(path).casefold(),
+    )
+    deleted = 0
+    failures: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            failures.append({"path": str(path), "reason": str(exc)})
+    return deleted, failures
 
 
 def _parse_exif_datetime(value: object) -> datetime | None:
@@ -286,6 +329,7 @@ def scan_folder(
     day_limit: int | None = None,
     date_order: Literal["oldest", "newest"] = "oldest",
     on_date_range: DateRangeCallback | None = None,
+    cleanup_json_files: bool = False,
 ) -> dict:
     started = time.perf_counter()
     folder = folder.expanduser().resolve()
@@ -302,9 +346,19 @@ def scan_folder(
     if date_order not in {"oldest", "newest"}:
         raise ValueError("날짜 정렬 방향이 올바르지 않습니다.")
 
-    paths = discover_images(folder, include_subfolders=include_subfolders)
-    records: list[ImageRecord] = []
+    json_files_deleted = 0
     failures: list[dict[str, str]] = []
+    if cleanup_json_files:
+        json_files_deleted, json_failures = delete_json_files(
+            folder,
+            include_subfolders=include_subfolders,
+        )
+        failures.extend(json_failures)
+
+    image_paths = discover_images(folder, include_subfolders=include_subfolders)
+    video_paths = discover_videos(folder, include_subfolders=include_subfolders)
+    paths = sorted(image_paths + video_paths, key=lambda path: str(path).casefold())
+    records: list[ImageRecord] = []
     progress_lock = threading.Lock()
     workers = max_workers or min(8, max(2, (os.cpu_count() or 4)))
     capture_info_by_path: dict[Path, tuple[datetime, str]] = {}
@@ -347,14 +401,23 @@ def scan_folder(
                 max(selected_capture_days).isoformat() if selected_capture_days else None,
             )
 
+    selected_image_paths = [
+        path for path in paths_to_analyze if path.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+    selected_video_paths = [
+        path
+        for path in paths_to_analyze
+        if path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
+    ]
+
     if on_progress:
-        on_progress(0, len(paths_to_analyze), "analyzing")
+        on_progress(0, len(selected_image_paths), "analyzing")
 
     completed = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(analyze_image, path, capture_info_by_path.get(path)): path
-            for path in paths_to_analyze
+            for path in selected_image_paths
         }
         for future in as_completed(futures):
             path = futures[future]
@@ -365,11 +428,22 @@ def scan_folder(
             with progress_lock:
                 completed += 1
                 if on_progress:
-                    on_progress(completed, len(paths_to_analyze), "analyzing")
+                    on_progress(completed, len(selected_image_paths), "analyzing")
 
     records.sort(key=lambda record: (record.captured_at, record.path.name.casefold(), str(record.path)))
+    valid_video_paths: list[Path] = []
+    for path in selected_video_paths:
+        try:
+            capture_info_by_path[path] = capture_info_by_path.get(path) or capture_time(path)
+            valid_video_paths.append(path)
+        except Exception as exc:
+            failures.append({"path": str(path), "reason": str(exc)})
     if day_limit is None:
-        selected_capture_days = {record.captured_at.date() for record in records}
+        selected_capture_days = {
+            record.captured_at.date() for record in records
+        } | {
+            capture_info_by_path[path][0].date() for path in valid_video_paths
+        }
         available_days = selected_capture_days
         if on_date_range:
             on_date_range(
@@ -466,6 +540,42 @@ def scan_folder(
             }
         )
 
+    for path in valid_video_paths:
+        captured_at, time_source = capture_info_by_path[path]
+        identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+        stat = path.stat()
+        video = {
+            "id": identity,
+            "name": path.name,
+            "path": str(path.resolve()),
+            "relative_path": path.resolve().relative_to(folder).as_posix(),
+            "captured_at": captured_at.isoformat(),
+            "time_source": time_source,
+            "media_type": "video",
+            "width": 0,
+            "height": 0,
+            "size_bytes": stat.st_size,
+            "sharpness": 0.0,
+            "similarity_to_keep": 100.0,
+            "similarity_by_id": {identity: 100.0},
+            "reference_id": identity,
+            "marked": False,
+        }
+        groups.append(
+            {
+                "id": f"video-{identity}",
+                "keep_id": identity,
+                "keep_ids": [identity],
+                "images": [video],
+                "member_count": 1,
+                "folder_count": 1,
+                "max_similarity": 100.0,
+                "min_similarity": 100.0,
+                "time_start": captured_at.isoformat(),
+                "time_end": captured_at.isoformat(),
+            }
+        )
+
     groups.sort(key=lambda group: group["time_start"])
     marked_images = [image for group in groups for image in group["images"] if image["marked"]]
     duration = time.perf_counter() - started
@@ -475,6 +585,7 @@ def scan_folder(
         "time_window_seconds": time_window_seconds,
         "keeper_strategy": keeper_strategy,
         "include_subfolders": include_subfolders,
+        "cleanup_json_files": cleanup_json_files,
         "day_limit": day_limit,
         "date_order": date_order,
         "selected_date_start": (
@@ -495,7 +606,9 @@ def scan_folder(
             "source_folders": len({path.parent for path in paths_to_analyze}),
             "available_days": len(available_days),
             "selected_days": len(selected_capture_days),
-            "analyzed": len(records),
+            "analyzed": len(records) + len(valid_video_paths),
+            "videos": len(valid_video_paths),
+            "json_files_deleted": json_files_deleted,
             "pairs_compared": len(pairs_in_window),
             "matched_pairs": len(matching_pairs),
             "groups": len(groups),
@@ -523,6 +636,7 @@ def _serialize_record(
         "relative_path": record.path.relative_to(root).as_posix(),
         "captured_at": record.captured_at.isoformat(),
         "time_source": record.time_source,
+        "media_type": "image",
         "width": record.width,
         "height": record.height,
         "size_bytes": record.size_bytes,
