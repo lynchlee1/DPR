@@ -9,9 +9,11 @@ prepare_python_environment "$PROJECT_DIR/.venv-build" "$PROJECT_DIR/requirements
 
 cd frontend
 npm ci --silent
+npm audit --audit-level=low
 npm run build --silent
 cd "$PROJECT_DIR"
 
+"$UV_BIN" tool run pip-audit==2.10.1 --requirement requirements.txt
 .venv-build/bin/python -m pytest -q
 .venv-build/bin/python -m PyInstaller \
   --noconfirm \

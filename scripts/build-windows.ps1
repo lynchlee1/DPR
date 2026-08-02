@@ -8,11 +8,13 @@ Initialize-PythonEnvironment -EnvironmentDir "$ProjectDir\.venv-build" -Requirem
 Push-Location frontend
 try {
     npm ci --silent
+    npm audit --audit-level=low
     npm run build --silent
 } finally {
     Pop-Location
 }
 
+& $UvExe tool run pip-audit==2.10.1 --requirement requirements.txt
 & ".venv-build\Scripts\python.exe" -m pytest -q
 & ".venv-build\Scripts\python.exe" -m PyInstaller `
     --noconfirm `

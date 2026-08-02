@@ -206,7 +206,7 @@ def _analyze_image_cached(
     else:
         width, height = original_width, original_height
 
-    identity = hashlib.sha1(path_text.encode("utf-8")).hexdigest()[:16]
+    identity = hashlib.sha256(path_text.encode("utf-8")).hexdigest()[:16]
     return ImageRecord(
         id=identity,
         path=path,

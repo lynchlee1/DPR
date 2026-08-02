@@ -7,7 +7,8 @@ import gc
 import io
 import platform
 from pathlib import Path
-import subprocess
+# Only a fixed macOS system command is executed below.
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .core import clear_analysis_cache, scan_folder
 from .storage import move_selection_to_storage
@@ -96,6 +98,10 @@ class ScanSession:
 
 
 app = FastAPI(title="사진 정리", version="1.0.0")
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost"],
+)
 sessions: dict[str, ScanSession] = {}
 sessions_lock = threading.Lock()
 
@@ -212,8 +218,9 @@ def pick_folder(
     )
     if platform.system() == "Darwin":
         script = f'POSIX path of (choose folder with prompt "{prompt}")'
-        completed = subprocess.run(
-            ["osascript", "-e", script],
+        # The executable and AppleScript are fixed, with no shell involved.
+        completed = subprocess.run(  # nosec B603
+            ["/usr/bin/osascript", "-e", script],
             capture_output=True,
             text=True,
             timeout=120,

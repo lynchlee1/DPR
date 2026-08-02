@@ -11,3 +11,20 @@ build/
 dist/
 *.spec
 *.tsbuildinfo
+
+# Personal photo and video files must never be committed.
+*.jpg
+*.jpeg
+*.heic
+*.heif
+*.png
+*.gif
+*.webp
+*.tif
+*.tiff
+*.raw
+*.dng
+*.mov
+*.mp4
+*.avi
+*.mkv
