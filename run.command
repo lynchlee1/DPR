@@ -17,16 +17,12 @@ if lsof -tiTCP:8765 -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -d .venv ]]; then
-  python3 -m venv .venv
-fi
-
-source .venv/bin/activate
-python -m pip install --quiet --disable-pip-version-check -r requirements.txt
+source "$PROJECT_DIR/scripts/bootstrap-macos.zsh"
+prepare_python_environment "$PROJECT_DIR/.venv" "$PROJECT_DIR/requirements.txt"
 
 cd frontend
-npm install --silent
+npm ci --silent
 npm run build --silent
 cd "$PROJECT_DIR"
 
-PYTHONPATH="$PROJECT_DIR/src" python -m photo_sorter.server
+PYTHONPATH="$PROJECT_DIR/src" "$PROJECT_DIR/.venv/bin/python" -m photo_sorter.server

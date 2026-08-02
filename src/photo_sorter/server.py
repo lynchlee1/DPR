@@ -8,6 +8,7 @@ import io
 import platform
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 from typing import Literal
@@ -25,7 +26,11 @@ from .storage import move_selection_to_storage
 from .trash import move_selection_to_trash
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = (
+    Path(sys._MEIPASS)
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[2]
+)
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
 

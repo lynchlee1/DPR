@@ -4,13 +4,23 @@
 
 ## 실행
 
+Python이나 Node.js를 미리 설치할 필요가 없습니다. 첫 실행에 필요한 도구를 프로젝트 내부에 자동으로 내려받으므로 인터넷 연결만 필요합니다.
+
 macOS Finder에서 `run.command`를 더블 클릭하거나 터미널에서 다음을 실행합니다.
 
 ```bash
 ./run.command
 ```
 
+Windows에서는 PowerShell에서 다음을 실행합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
 첫 실행에는 Python과 프런트엔드 의존성 설치로 시간이 조금 더 걸립니다. 이후 브라우저에서 `http://127.0.0.1:8765`가 자동으로 열립니다.
+
+빌드하는 컴퓨터에도 Python이나 Node.js를 미리 설치할 필요가 없습니다. 자세한 방법은 [Windows·macOS 빌드 안내](docs/build.md)를 참고하세요. 버전 태그를 푸시하면 GitHub Releases에 macOS와 Windows용 ZIP이 자동으로 등록됩니다. 최종 사용자는 프로젝트 코드를 받지 않고 운영체제에 맞는 ZIP만 내려받으면 되며, 배포본은 Python 런타임을 포함하므로 인터넷 연결 없이 실행됩니다.
 
 ## 프로젝트 구조
 
@@ -19,6 +29,8 @@ src/photo_sorter/  Python 백엔드와 이미지 분석
 frontend/src/      React 사용자 인터페이스
 tests/             백엔드 단위 테스트
 run.command        macOS 실행 진입점
+run.ps1            Windows 실행 진입점
+scripts/           운영체제별 배포 빌드 스크립트
 ```
 
 ## 사용 흐름
