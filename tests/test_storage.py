@@ -270,6 +270,25 @@ def test_storage_selection_rejects_unknown_and_outside_files(tmp_path: Path) -> 
         validate_storage_selection(result, ["first"], destination)
 
 
+def test_storage_selection_accepts_files_from_all_selected_folders(tmp_path: Path) -> None:
+    first_source = tmp_path / "first-source"
+    second_source = tmp_path / "second-source"
+    destination = tmp_path / "archive"
+    first_source.mkdir()
+    second_source.mkdir()
+    destination.mkdir()
+    result = make_result(first_source)
+    second_photo = second_source / "second.jpg"
+    second_photo.write_bytes(b"second source")
+    result["folder"] = str(first_source)
+    result["folders"] = [str(first_source), str(second_source)]
+    result["groups"][0]["images"][1]["path"] = str(second_photo)
+
+    _, images = validate_storage_selection(result, ["second"], destination)
+
+    assert images[0][1] == second_photo
+
+
 def test_storage_directory_must_exist(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

@@ -30,7 +30,10 @@ def validate_storage_selection(
     if not destination.is_dir():
         raise NotADirectoryError(f"저장 디렉터리를 찾을 수 없습니다: {destination}")
 
-    root = Path(result["folder"]).resolve()
+    roots = [
+        Path(folder).resolve()
+        for folder in result.get("folders", [result["folder"]])
+    ]
     known: dict[str, dict] = {
         image["id"]: image
         for group in result["groups"]
@@ -44,10 +47,8 @@ def validate_storage_selection(
     for image_id in selected:
         image = known[image_id]
         path = Path(image["path"]).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("선택한 폴더 밖의 파일은 이동할 수 없습니다.") from exc
+        if not any(path == root or root in path.parents for root in roots):
+            raise ValueError("선택한 폴더 밖의 파일은 이동할 수 없습니다.")
         images.append((image, path))
 
     images.sort(key=lambda item: str(item[1]).casefold())

@@ -17,7 +17,10 @@ def validate_trash_selection(
     if not selected:
         raise ValueError("휴지통으로 보낼 사진을 선택해 주세요.")
 
-    root = Path(result["folder"]).resolve()
+    roots = [
+        Path(folder).resolve()
+        for folder in result.get("folders", [result["folder"]])
+    ]
     known: dict[str, Path] = {}
     for group in result["groups"]:
         group_ids = {image["id"] for image in group["images"]}
@@ -34,10 +37,8 @@ def validate_trash_selection(
     paths: list[Path] = []
     for image_id in selected:
         path = known[image_id]
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("선택한 폴더 밖의 파일은 이동할 수 없습니다.") from exc
+        if not any(path == root or root in path.parents for root in roots):
+            raise ValueError("선택한 폴더 밖의 파일은 이동할 수 없습니다.")
         paths.append(path)
     return sorted(paths, key=lambda path: str(path).casefold())
 

@@ -50,6 +50,23 @@ def test_unknown_and_outside_paths_are_rejected(tmp_path: Path) -> None:
         validate_trash_selection(result, ["first"])
 
 
+def test_selection_accepts_files_from_all_selected_folders(tmp_path: Path) -> None:
+    first_source = tmp_path / "first-source"
+    second_source = tmp_path / "second-source"
+    first_source.mkdir()
+    second_source.mkdir()
+    result = make_result(first_source)
+    second_photo = second_source / "second.jpg"
+    second_photo.write_bytes(b"second source")
+    result["folder"] = str(first_source)
+    result["folders"] = [str(first_source), str(second_source)]
+    result["groups"][0]["images"][1]["path"] = str(second_photo)
+
+    paths = validate_trash_selection(result, ["second"])
+
+    assert paths == [second_photo]
+
+
 def test_move_uses_injected_trash_mover(tmp_path: Path) -> None:
     result = make_result(tmp_path)
     moved: list[str] = []
