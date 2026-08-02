@@ -114,7 +114,7 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.1.0")
+app = FastAPI(title="사진 정리", version="1.1.1")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
