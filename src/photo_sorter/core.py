@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
@@ -32,6 +33,19 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 EXIF_TIME_KEYS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, DateTime
 ProgressCallback = Callable[[int, int, str], None]
 DateRangeCallback = Callable[[str | None, str | None], None]
+CancelCallback = Callable[[], bool]
+ANALYSIS_CACHE_MAX_SIZE = 10_000
+_analysis_cache_keys: OrderedDict[tuple, None] = OrderedDict()
+_analysis_cache_lock = threading.Lock()
+
+
+class ScanCancelled(Exception):
+    """Raised when a running scan receives a cooperative cancellation request."""
+
+
+def _raise_if_cancelled(should_cancel: CancelCallback | None) -> None:
+    if should_cancel and should_cancel():
+        raise ScanCancelled("사진 분석을 중단했습니다.")
 
 
 @dataclass(frozen=True)
@@ -216,16 +230,23 @@ def analyze_image(
     resolved = path.resolve()
     stat = resolved.stat()
     captured_at, time_source = capture_info or (None, None)
-    return _analyze_image_cached(
+    cache_key = (
         str(resolved),
         stat.st_mtime_ns,
         stat.st_size,
         captured_at,
         time_source,
     )
+    record = _analyze_image_cached(*cache_key)
+    with _analysis_cache_lock:
+        _analysis_cache_keys.pop(cache_key, None)
+        _analysis_cache_keys[cache_key] = None
+        while len(_analysis_cache_keys) > ANALYSIS_CACHE_MAX_SIZE:
+            _analysis_cache_keys.popitem(last=False)
+    return record
 
 
-@lru_cache(maxsize=10_000)
+@lru_cache(maxsize=ANALYSIS_CACHE_MAX_SIZE)
 def _analyze_image_cached(
     path_text: str,
     modified_ns: int,
@@ -269,7 +290,30 @@ def _analyze_image_cached(
 def clear_analysis_cache() -> int:
     entry_count = _analyze_image_cached.cache_info().currsize
     _analyze_image_cached.cache_clear()
+    with _analysis_cache_lock:
+        _analysis_cache_keys.clear()
     return entry_count
+
+
+def analysis_cache_entries() -> list[dict]:
+    """Return cached analysis entries grouped by source file for display."""
+    with _analysis_cache_lock:
+        path_texts = [key[0] for key in _analysis_cache_keys]
+
+    counts_by_path: dict[str, int] = {}
+    for path_text in path_texts:
+        counts_by_path[path_text] = counts_by_path.get(path_text, 0) + 1
+    return [
+        {
+            "name": Path(path_text).name,
+            "path": path_text,
+            "entry_count": entry_count,
+        }
+        for path_text, entry_count in sorted(
+            counts_by_path.items(),
+            key=lambda item: item[0].casefold(),
+        )
+    ]
 
 
 def similarity(left: ImageRecord, right: ImageRecord) -> float:
@@ -330,6 +374,7 @@ def scan_folder(
     date_order: Literal["oldest", "newest"] = "oldest",
     on_date_range: DateRangeCallback | None = None,
     cleanup_json_files: bool = False,
+    should_cancel: CancelCallback | None = None,
 ) -> dict:
     started = time.perf_counter()
     folder = folder.expanduser().resolve()
@@ -345,10 +390,12 @@ def scan_folder(
         raise ValueError("분석 날짜 수는 1일 이상이어야 합니다.")
     if date_order not in {"oldest", "newest"}:
         raise ValueError("날짜 정렬 방향이 올바르지 않습니다.")
+    _raise_if_cancelled(should_cancel)
 
     json_files_deleted = 0
     failures: list[dict[str, str]] = []
     if cleanup_json_files:
+        _raise_if_cancelled(should_cancel)
         json_files_deleted, json_failures = delete_json_files(
             folder,
             include_subfolders=include_subfolders,
@@ -370,9 +417,12 @@ def scan_folder(
         if on_progress:
             on_progress(0, len(paths), "indexing")
         completed = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        cancelled = False
+        try:
             futures = {pool.submit(capture_time, path): path for path in paths}
             for future in as_completed(futures):
+                _raise_if_cancelled(should_cancel)
                 path = futures[future]
                 try:
                     capture_info_by_path[path] = future.result()
@@ -382,6 +432,11 @@ def scan_folder(
                     completed += 1
                     if on_progress:
                         on_progress(completed, len(paths), "indexing")
+        except ScanCancelled:
+            cancelled = True
+            raise
+        finally:
+            pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
 
         available_days = {
             captured_at.date()
@@ -414,12 +469,15 @@ def scan_folder(
         on_progress(0, len(selected_image_paths), "analyzing")
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    cancelled = False
+    try:
         futures = {
             pool.submit(analyze_image, path, capture_info_by_path.get(path)): path
             for path in selected_image_paths
         }
         for future in as_completed(futures):
+            _raise_if_cancelled(should_cancel)
             path = futures[future]
             try:
                 records.append(future.result())
@@ -429,6 +487,11 @@ def scan_folder(
                 completed += 1
                 if on_progress:
                     on_progress(completed, len(selected_image_paths), "analyzing")
+    except ScanCancelled:
+        cancelled = True
+        raise
+    finally:
+        pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
 
     records.sort(key=lambda record: (record.captured_at, record.path.name.casefold(), str(record.path)))
     valid_video_paths: list[Path] = []
@@ -455,6 +518,7 @@ def scan_folder(
     pair_total = max(len(records) - 1, 0)
 
     for index, (left, right) in enumerate(zip(records, records[1:]), start=1):
+        _raise_if_cancelled(should_cancel)
         gap = (right.captured_at - left.captured_at).total_seconds()
         if 0 <= gap <= time_window_seconds:
             pair = SimilarityPair(left.id, right.id, gap, similarity(left, right))
@@ -468,6 +532,7 @@ def scan_folder(
     groups: list[dict] = []
 
     for number, members in enumerate(raw_groups, start=1):
+        _raise_if_cancelled(should_cancel)
         members.sort(key=lambda record: (record.captured_at, record.path.name.casefold()))
         folder_count = len({member.path.parent for member in members})
         member_ids = {member.id for member in members}
@@ -481,6 +546,7 @@ def scan_folder(
             member.id: {member.id: 100.0} for member in members
         }
         for left_index, left in enumerate(members):
+            _raise_if_cancelled(should_cancel)
             for right in members[left_index + 1 :]:
                 score = similarity(left, right)
                 similarity_matrix[left.id][right.id] = score

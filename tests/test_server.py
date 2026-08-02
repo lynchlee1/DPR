@@ -56,6 +56,74 @@ def test_scan_preserves_date_limit_and_order(tmp_path: Path, monkeypatch) -> Non
     server.sessions.pop(payload["id"], None)
 
 
+def test_scan_reuses_completed_result_when_files_and_settings_match(tmp_path: Path) -> None:
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"photo")
+    request = server.ScanRequest(folder=str(tmp_path))
+    session = server.ScanSession(
+        id="reusable-scan",
+        folder=str(tmp_path.resolve()),
+        threshold=88,
+        time_window_seconds=60,
+        status="complete",
+        phase="complete",
+        result={"folder": str(tmp_path.resolve()), "groups": []},
+        source_signature=server._source_signature(tmp_path, True, False),
+    )
+    server.sessions[session.id] = session
+
+    payload = server.create_scan(request)
+
+    assert payload["id"] == session.id
+    assert payload["status"] == "complete"
+    assert payload["reused"] is True
+    server.sessions.pop(session.id, None)
+
+
+def test_scan_does_not_reuse_result_after_a_file_changes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"before")
+    request = server.ScanRequest(folder=str(tmp_path))
+    previous = server.ScanSession(
+        id="old-scan",
+        folder=str(tmp_path.resolve()),
+        threshold=88,
+        time_window_seconds=60,
+        status="complete",
+        result={"folder": str(tmp_path.resolve()), "groups": []},
+        source_signature=server._source_signature(tmp_path, True, False),
+    )
+    server.sessions[previous.id] = previous
+    photo.write_bytes(b"after-change")
+
+    payload = server.create_scan(request)
+
+    assert payload["id"] != previous.id
+    assert payload["status"] == "queued"
+    server.sessions.pop(previous.id, None)
+    server.sessions.pop(payload["id"], None)
+
+
+def test_cancel_running_scan_sets_cooperative_cancel_signal() -> None:
+    session = server.ScanSession(
+        id="running-cancel",
+        folder="/tmp/photos",
+        threshold=88,
+        time_window_seconds=60,
+        status="running",
+        active_operation="scan",
+    )
+    server.sessions[session.id] = session
+
+    payload = server.cancel_operation(session.id)
+
+    assert payload == {"accepted": True, "operation": "scan"}
+    assert session.cancel_event.is_set()
+    assert session.status == "cancelling"
+    server.sessions.pop(session.id, None)
+
+
 def test_scan_worker_passes_subfolder_choice(tmp_path: Path, monkeypatch) -> None:
     received: dict = {}
 
@@ -135,6 +203,30 @@ def test_reset_calculations_rejects_running_scan() -> None:
     server.sessions.pop(session.id, None)
 
 
+def test_get_calculation_cache_lists_analysis_files(monkeypatch) -> None:
+    monkeypatch.setattr(server, "analysis_cache_entries", lambda: [
+        {"name": "photo.jpg", "path": "/tmp/photos/photo.jpg", "entry_count": 2},
+    ])
+    monkeypatch.setattr(server._render_image, "cache_info", lambda: SimpleNamespace(currsize=3))
+    server.sessions["cached-scan"] = server.ScanSession(
+        id="cached-scan",
+        folder="/tmp/photos",
+        threshold=88,
+        time_window_seconds=60,
+        status="complete",
+    )
+
+    assert server.get_calculation_cache() == {
+        "analysis_entry_count": 2,
+        "analysis_files": [
+            {"name": "photo.jpg", "path": "/tmp/photos/photo.jpg", "entry_count": 2},
+        ],
+        "preview_entry_count": 3,
+        "session_count": 1,
+    }
+    server.sessions.pop("cached-scan", None)
+
+
 def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch) -> None:
     session = server.ScanSession(
         id="storage-scan",
@@ -147,11 +239,12 @@ def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch
     server.sessions[session.id] = session
     received: dict = {}
 
-    def fake_store(result: dict, image_ids: list[str], destination: Path) -> dict:
+    def fake_store(result: dict, image_ids: list[str], destination: Path, **kwargs) -> dict:
         received.update(
             result=result,
             image_ids=image_ids,
             destination=destination,
+            should_cancel=kwargs.get("should_cancel"),
         )
         return {"moved": [], "failures": []}
 
@@ -169,4 +262,5 @@ def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch
     assert received["result"] is session.result
     assert received["image_ids"] == ["photo-1"]
     assert received["destination"] == tmp_path / "archive"
+    assert callable(received["should_cancel"])
     server.sessions.pop(session.id, None)

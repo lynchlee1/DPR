@@ -60,6 +60,25 @@ def test_move_uses_injected_trash_mover(tmp_path: Path) -> None:
     assert moved == [str(tmp_path / "second.jpg")]
 
 
+def test_trash_move_stops_between_files(tmp_path: Path) -> None:
+    result = make_result(tmp_path)
+    moved: list[str] = []
+
+    outcome = move_selection_to_trash(
+        result,
+        ["first", "second"],
+        allow_delete_all=True,
+        mover=moved.append,
+        should_cancel=lambda: len(moved) == 1,
+    )
+
+    assert outcome == {
+        "moved": [str(tmp_path / "first.jpg")],
+        "failures": [],
+        "cancelled": True,
+    }
+
+
 def test_move_can_explicitly_trash_every_image_in_a_group(tmp_path: Path) -> None:
     result = make_result(tmp_path)
     moved: list[str] = []

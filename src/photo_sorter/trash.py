@@ -5,6 +5,7 @@ from typing import Callable, Iterable
 
 
 TrashMover = Callable[[str], None]
+CancelCallback = Callable[[], bool]
 
 
 def validate_trash_selection(
@@ -46,6 +47,7 @@ def move_selection_to_trash(
     image_ids: Iterable[str],
     allow_delete_all: bool = False,
     mover: TrashMover | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> dict:
     if mover is None:
         from send2trash import send2trash
@@ -56,6 +58,8 @@ def move_selection_to_trash(
     moved: list[str] = []
     failures: list[dict[str, str]] = []
     for path in paths:
+        if should_cancel and should_cancel():
+            return {"moved": moved, "failures": failures, "cancelled": True}
         if not path.is_file():
             failures.append(
                 {"path": str(path), "reason": f"파일을 찾을 수 없습니다: {path.name}"}

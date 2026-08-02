@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from photo_sorter import core
-from photo_sorter.core import analyze_image, capture_time, discover_images, discover_videos, scan_folder, similarity
+from photo_sorter.core import analysis_cache_entries, analyze_image, capture_time, discover_images, discover_videos, scan_folder, similarity
 
 
 def save_image(path: Path, color: tuple[int, int, int], exif_time: str | None = None) -> None:
@@ -330,6 +330,27 @@ def test_clear_analysis_cache_discards_cached_records(tmp_path: Path) -> None:
 
     assert cleared >= 1
     assert second is not first
+
+
+def test_analysis_cache_entries_are_represented_by_filename(tmp_path: Path) -> None:
+    first_path = tmp_path / "first-photo.jpg"
+    second_path = tmp_path / "nested" / "second-photo.jpg"
+    second_path.parent.mkdir()
+    save_image(first_path, (26, 93, 142))
+    save_image(second_path, (170, 48, 35))
+
+    core.clear_analysis_cache()
+    analyze_image(second_path)
+    analyze_image(first_path)
+    analyze_image(first_path)
+
+    assert analysis_cache_entries() == [
+        {"name": "first-photo.jpg", "path": str(first_path), "entry_count": 1},
+        {"name": "second-photo.jpg", "path": str(second_path), "entry_count": 1},
+    ]
+
+    core.clear_analysis_cache()
+    assert analysis_cache_entries() == []
 
 
 def test_one_minute_chain_forms_one_five_photo_group(tmp_path: Path) -> None:

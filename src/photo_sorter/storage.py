@@ -9,6 +9,7 @@ from typing import Callable, Iterable
 
 
 StorageMover = Callable[[str, str], object]
+CancelCallback = Callable[[], bool]
 
 
 def _move_file(source: str, destination: str) -> object:
@@ -83,6 +84,7 @@ def move_selection_to_storage(
     image_ids: Iterable[str],
     destination: Path,
     mover: StorageMover | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> dict:
     destination, images = validate_storage_selection(result, image_ids, destination)
     mover = mover or _move_file
@@ -114,6 +116,8 @@ def move_selection_to_storage(
             ) from exc
 
     for source, target_folder in planned:
+        if should_cancel and should_cancel():
+            return {"moved": moved, "failures": failures, "cancelled": True}
         target: Path | None = None
         try:
             expected_target = (target_folder / source.name).resolve()

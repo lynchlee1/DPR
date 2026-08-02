@@ -23,7 +23,14 @@ from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .core import clear_analysis_cache, scan_folder
+from .core import (
+    SUPPORTED_EXTENSIONS,
+    SUPPORTED_VIDEO_EXTENSIONS,
+    ScanCancelled,
+    analysis_cache_entries,
+    clear_analysis_cache,
+    scan_folder,
+)
 from .storage import move_selection_to_storage
 from .trash import move_selection_to_trash
 
@@ -77,6 +84,9 @@ class ScanSession:
     result: dict | None = None
     error: str | None = None
     created_at: float = field(default_factory=time.time)
+    source_signature: tuple[tuple[str, int, int], ...] = field(default_factory=tuple, repr=False)
+    active_operation: str | None = field(default=None, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def payload(self) -> dict:
         return {
@@ -100,13 +110,47 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.0.1")
+app = FastAPI(title="사진 정리", version="1.0.2")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
 )
 sessions: dict[str, ScanSession] = {}
 sessions_lock = threading.Lock()
+
+
+def _source_signature(
+    folder: Path,
+    include_subfolders: bool,
+    include_json: bool,
+) -> tuple[tuple[str, int, int], ...]:
+    candidates = folder.rglob("*") if include_subfolders else folder.iterdir()
+    supported = SUPPORTED_EXTENSIONS | SUPPORTED_VIDEO_EXTENSIONS
+    if include_json:
+        supported = supported | {".json"}
+    signature: list[tuple[str, int, int]] = []
+    for path in candidates:
+        if not path.is_file() or path.suffix.lower() not in supported:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+    return tuple(sorted(signature))
+
+
+def _same_scan(session: ScanSession, request: ScanRequest, folder: Path) -> bool:
+    return (
+        session.folder == str(folder)
+        and session.threshold == request.threshold
+        and session.time_window_seconds == request.time_window_seconds
+        and session.mode == request.mode
+        and session.include_subfolders == request.include_subfolders
+        and session.day_limit == request.day_limit
+        and session.date_order == request.date_order
+        and session.cleanup_json_files == request.cleanup_json_files
+    )
 
 
 def _update_progress(session: ScanSession, completed: int, total: int, phase: str) -> None:
@@ -129,6 +173,7 @@ def _update_date_range(
 def _run_scan(session: ScanSession) -> None:
     with sessions_lock:
         session.status = "running"
+        session.active_operation = "scan"
     try:
         result = scan_folder(
             Path(session.folder),
@@ -141,17 +186,32 @@ def _run_scan(session: ScanSession) -> None:
             date_order=session.date_order,
             on_date_range=lambda start, end: _update_date_range(session, start, end),
             cleanup_json_files=session.cleanup_json_files,
+            should_cancel=session.cancel_event.is_set,
+        )
+        signature = _source_signature(
+            Path(session.folder),
+            session.include_subfolders,
+            session.cleanup_json_files,
         )
         with sessions_lock:
             session.result = result
+            session.source_signature = signature
             session.status = "complete"
             session.phase = "complete"
             session.completed = session.total
+    except ScanCancelled:
+        with sessions_lock:
+            session.status = "cancelled"
+            session.phase = "cancelled"
+            session.error = None
     except Exception as exc:
         with sessions_lock:
             session.status = "error"
             session.phase = "error"
             session.error = str(exc)
+    finally:
+        with sessions_lock:
+            session.active_operation = None
 
 
 def _get_session(scan_id: str) -> ScanSession:
@@ -192,7 +252,10 @@ def health() -> dict:
 @app.post("/api/calculations/reset")
 def reset_calculations() -> dict:
     with sessions_lock:
-        if any(session.status in {"queued", "running"} for session in sessions.values()):
+        if any(
+            session.status in {"queued", "running", "cancelling"} or session.active_operation
+            for session in sessions.values()
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="사진 분석이 끝난 뒤 계산값을 초기화해 주세요.",
@@ -208,6 +271,19 @@ def reset_calculations() -> dict:
         "cleared_sessions": cleared_sessions,
         "cleared_analysis_entries": cleared_analysis_entries,
         "cleared_preview_entries": cleared_preview_entries,
+    }
+
+
+@app.get("/api/calculations/cache")
+def get_calculation_cache() -> dict:
+    entries = analysis_cache_entries()
+    with sessions_lock:
+        session_count = len(sessions)
+    return {
+        "analysis_entry_count": sum(entry["entry_count"] for entry in entries),
+        "analysis_files": entries,
+        "preview_entry_count": _render_image.cache_info().currsize,
+        "session_count": session_count,
     }
 
 
@@ -253,6 +329,24 @@ def create_scan(request: ScanRequest) -> dict:
     if not folder.is_dir():
         raise HTTPException(status_code=400, detail="존재하는 폴더를 선택해 주세요.")
 
+    signature = _source_signature(folder, request.include_subfolders, request.cleanup_json_files)
+    with sessions_lock:
+        reusable = next(
+            (
+                existing
+                for existing in reversed(list(sessions.values()))
+                if existing.status == "complete"
+                and existing.result is not None
+                and existing.source_signature == signature
+                and _same_scan(existing, request, folder)
+            ),
+            None,
+        )
+    if reusable is not None:
+        payload = reusable.payload()
+        payload["reused"] = True
+        return payload
+
     session = ScanSession(
         id=uuid.uuid4().hex[:12],
         folder=str(folder),
@@ -263,6 +357,8 @@ def create_scan(request: ScanRequest) -> dict:
         day_limit=request.day_limit,
         date_order=request.date_order,
         cleanup_json_files=request.cleanup_json_files,
+        source_signature=signature,
+        active_operation="scan",
     )
     with sessions_lock:
         sessions[session.id] = session
@@ -273,6 +369,20 @@ def create_scan(request: ScanRequest) -> dict:
 @app.get("/api/scans/{scan_id}")
 def get_scan(scan_id: str) -> dict:
     return _get_session(scan_id).payload()
+
+
+@app.post("/api/scans/{scan_id}/cancel", status_code=202)
+def cancel_operation(scan_id: str) -> dict:
+    session = _get_session(scan_id)
+    with sessions_lock:
+        if not session.active_operation:
+            raise HTTPException(status_code=409, detail="중단할 작업이 없습니다.")
+        operation = session.active_operation
+        session.cancel_event.set()
+        if operation == "scan":
+            session.status = "cancelling"
+            session.phase = "cancelling"
+    return {"accepted": True, "operation": operation}
 
 
 @app.get("/api/scans/{scan_id}/images/{image_id}")
@@ -295,14 +405,23 @@ def trash_marked(scan_id: str, request: TrashRequest) -> dict:
     session = _get_session(scan_id)
     if not session.result:
         raise HTTPException(status_code=409, detail="사진 분석이 아직 완료되지 않았습니다.")
+    with sessions_lock:
+        if session.active_operation:
+            raise HTTPException(status_code=409, detail="다른 작업이 진행 중입니다.")
+        session.cancel_event.clear()
+        session.active_operation = "trash"
     try:
         outcome = move_selection_to_trash(
             session.result,
             request.image_ids,
             allow_delete_all=request.allow_delete_all,
+            should_cancel=session.cancel_event.is_set,
         )
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        with sessions_lock:
+            session.active_operation = None
     return outcome
 
 
@@ -311,14 +430,23 @@ def store_kept(scan_id: str, request: StoreRequest) -> dict:
     session = _get_session(scan_id)
     if not session.result:
         raise HTTPException(status_code=409, detail="사진 분석이 아직 완료되지 않았습니다.")
+    with sessions_lock:
+        if session.active_operation:
+            raise HTTPException(status_code=409, detail="다른 작업이 진행 중입니다.")
+        session.cancel_event.clear()
+        session.active_operation = "store"
     try:
         return move_selection_to_storage(
             session.result,
             request.image_ids,
             Path(request.destination),
+            should_cancel=session.cancel_event.is_set,
         )
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        with sessions_lock:
+            session.active_operation = None
 
 
 if FRONTEND_DIST.is_dir():

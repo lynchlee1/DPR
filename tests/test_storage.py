@@ -84,6 +84,32 @@ def test_moves_photo_from_single_photo_group(tmp_path: Path) -> None:
     assert (destination / "Photos" / "20240102" / "first.jpg").read_bytes() == b"first"
 
 
+def test_storage_move_stops_between_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "archive"
+    source.mkdir()
+    destination.mkdir()
+    result = make_result(source)
+    cancelled = False
+
+    def mover(source_path: str, destination_path: str) -> None:
+        nonlocal cancelled
+        Path(source_path).rename(destination_path)
+        cancelled = True
+
+    outcome = move_selection_to_storage(
+        result,
+        ["first", "second"],
+        destination,
+        mover=mover,
+        should_cancel=lambda: cancelled,
+    )
+
+    assert outcome["cancelled"] is True
+    assert len(outcome["moved"]) == 1
+    assert sum(path.exists() for path in (source / "first.jpg", source / "second.jpg")) == 1
+
+
 def test_existing_filename_with_different_hash_is_not_overwritten(tmp_path: Path) -> None:
     source = tmp_path / "source"
     destination = tmp_path / "archive"

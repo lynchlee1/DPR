@@ -7,6 +7,7 @@ import {
   CaretDown,
   Check,
   CheckCircle,
+  Database,
   FolderOpen,
   ImageSquare,
   Info,
@@ -16,6 +17,7 @@ import {
   Question,
   ShieldCheck,
   Sparkle,
+  Stop,
   Trash,
   WarningCircle,
   X,
@@ -23,7 +25,7 @@ import {
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { GuideOverlay, type GuideState } from "./GuideOverlay";
 
-type ScanStatus = "queued" | "running" | "complete" | "error";
+type ScanStatus = "queued" | "running" | "cancelling" | "cancelled" | "complete" | "error";
 type AnalysisMode = "standard" | "quick";
 type DateOrder = "oldest" | "newest";
 
@@ -112,21 +114,31 @@ type Session = {
   selected_date_start: string | null;
   selected_date_end: string | null;
   status: ScanStatus;
-  phase: "queued" | "indexing" | "analyzing" | "comparing" | "complete" | "error";
+  phase: "queued" | "indexing" | "analyzing" | "comparing" | "cancelling" | "cancelled" | "complete" | "error";
   completed: number;
   total: number;
   result: ScanResult | null;
   error: string | null;
+  reused?: boolean;
 };
 
 type CleanupOutcome = {
   moved: string[];
   failures: { path: string; reason: string }[];
+  cancelled?: boolean;
 };
 
 type StorageOutcome = {
   moved: { source: string; destination: string }[];
   failures: { path: string; destination?: string; reason: string }[];
+  cancelled?: boolean;
+};
+
+type CalculationCache = {
+  analysis_entry_count: number;
+  analysis_files: { name: string; path: string; entry_count: number }[];
+  preview_entry_count: number;
+  session_count: number;
 };
 
 function formatBytes(bytes: number): string {
@@ -288,12 +300,16 @@ export function App() {
   const [isPickingDestination, setIsPickingDestination] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [resetNotice, setResetNotice] = useState<string | null>(null);
+  const [isCacheDialogOpen, setIsCacheDialogOpen] = useState(false);
+  const [isCacheLoading, setIsCacheLoading] = useState(false);
+  const [calculationCache, setCalculationCache] = useState<CalculationCache | null>(null);
   const [isTrashDialogOpen, setIsTrashDialogOpen] = useState(false);
   const [trashThroughGroupIndex, setTrashThroughGroupIndex] = useState<number | null>(null);
   const [isTrashing, setIsTrashing] = useState(false);
   const [cleanupOutcome, setCleanupOutcome] = useState<CleanupOutcome | null>(null);
   const [isStorageDialogOpen, setIsStorageDialogOpen] = useState(false);
   const [isStoring, setIsStoring] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [storageOutcome, setStorageOutcome] = useState<StorageOutcome | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [guide, setGuide] = useState<GuideState | null>(() =>
@@ -302,7 +318,8 @@ export function App() {
   const helpButtonRef = useRef<HTMLButtonElement>(null);
   const lastArrowNavigationAtRef = useRef(0);
 
-  const isScanning = session?.status === "queued" || session?.status === "running";
+  const isScanning = session?.status === "queued" || session?.status === "running" || session?.status === "cancelling";
+  const isMoving = isStoring || isTrashing;
   const visibleGroups = useMemo(
     () => filterReviewGroups(result?.groups ?? [], showSingletons),
     [result, showSingletons],
@@ -357,7 +374,7 @@ export function App() {
       ].join(", ");
 
   useEffect(() => {
-    if (!session || session.status === "complete" || session.status === "error") return;
+    if (!session || session.status === "complete" || session.status === "error" || session.status === "cancelled") return;
     const timer = window.setInterval(async () => {
       try {
         const next = await api<Session>(`/api/scans/${session.id}`);
@@ -370,6 +387,11 @@ export function App() {
           setSelectedPhotoId(firstReviewPhoto(initialGroups[0])?.id ?? null);
         }
         if (next.status === "error") setError(next.error || "사진을 분석하는 중 오류가 발생했습니다.");
+        if (next.status === "cancelled") {
+          setSession(null);
+          setIsCancelling(false);
+          setResetNotice("사진 분석을 중단했습니다.");
+        }
       } catch (pollError) {
         setError(pollError instanceof Error ? pollError.message : "분석 상태를 확인하지 못했습니다.");
       }
@@ -486,11 +508,25 @@ export function App() {
     }
   }
 
-  async function resetCalculations() {
+  async function openCacheDialog() {
+    setIsCacheDialogOpen(true);
+    setIsCacheLoading(true);
+    setError(null);
+    try {
+      setCalculationCache(await api<CalculationCache>("/api/calculations/cache"));
+    } catch (cacheError) {
+      setIsCacheDialogOpen(false);
+      setError(cacheError instanceof Error ? cacheError.message : "캐시 목록을 불러오지 못했습니다.");
+    } finally {
+      setIsCacheLoading(false);
+    }
+  }
+
+  async function resetCalculations(): Promise<boolean> {
     const confirmed = window.confirm(
       "현재 분석 결과와 검토 상태를 지우고 메모리를 정리합니다. 원본 사진은 삭제되지 않습니다. 계속할까요?",
     );
-    if (!confirmed) return;
+    if (!confirmed) return false;
 
     setIsResetting(true);
     setError(null);
@@ -508,8 +544,10 @@ export function App() {
       setStorageOutcome(null);
       setGuide(null);
       setResetNotice("계산값과 현재 분석 결과를 초기화했습니다.");
+      return true;
     } catch (resetError) {
       setError(resetError instanceof Error ? resetError.message : "계산값을 초기화하지 못했습니다.");
+      return false;
     } finally {
       setIsResetting(false);
     }
@@ -541,8 +579,28 @@ export function App() {
         }),
       });
       setSession(next);
+      if (next.status === "complete" && next.result) {
+        const initialResult = next.mode === "quick" ? next.result : clearCandidateMarks(next.result);
+        const initialGroups = filterReviewGroups(initialResult.groups, showSingletons);
+        setResult(initialResult);
+        setSelectedGroupIndex(0);
+        setSelectedPhotoId(firstReviewPhoto(initialGroups[0])?.id ?? null);
+        if (next.reused) setResetNotice("파일과 설정이 같아 이전 계산 결과를 불러왔습니다.");
+      }
     } catch (scanError) {
       setError(scanError instanceof Error ? scanError.message : "사진 분석을 시작하지 못했습니다.");
+    }
+  }
+
+  async function stopActiveOperation() {
+    if (!session || (!isScanning && !isMoving) || isCancelling) return;
+    setIsCancelling(true);
+    setError(null);
+    try {
+      await api(`/api/scans/${session.id}/cancel`, { method: "POST" });
+    } catch (cancelError) {
+      setIsCancelling(false);
+      setError(cancelError instanceof Error ? cancelError.message : "작업을 중단하지 못했습니다.");
     }
   }
 
@@ -692,11 +750,15 @@ export function App() {
         removeMovedPhotos(resultBeforeMove, outcome.moved.map((item) => item.source)),
         selectedPhotoIdBeforeMove,
       );
+      if (outcome.cancelled) {
+        setResetNotice(`이동을 중단했습니다. 이미 옮긴 사진 ${outcome.moved.length.toLocaleString()}장은 이동된 위치에 남아 있습니다.`);
+      }
     } catch (storageError) {
       showRemainingPhotos(resultBeforeMove, selectedPhotoIdBeforeMove);
       setError(storageError instanceof Error ? storageError.message : "보관 사진을 저장 위치로 옮기지 못했습니다.");
     } finally {
       setIsStoring(false);
+      setIsCancelling(false);
     }
   }
 
@@ -731,11 +793,15 @@ export function App() {
         nextCandidateGroupIndex >= 0 ? null : selectedPhotoIdBeforeTrash,
         nextCandidateGroupIndex >= 0 ? nextCandidateGroupIndex : undefined,
       );
+      if (outcome.cancelled) {
+        setResetNotice(`휴지통 이동을 중단했습니다. 이미 옮긴 사진 ${outcome.moved.length.toLocaleString()}장은 휴지통에서 복원할 수 있습니다.`);
+      }
     } catch (trashError) {
       showRemainingPhotos(resultBeforeTrash, selectedPhotoIdBeforeTrash);
       setError(trashError instanceof Error ? trashError.message : "휴지통으로 이동하지 못했습니다.");
     } finally {
       setIsTrashing(false);
+      setIsCancelling(false);
       setTrashThroughGroupIndex(null);
     }
   }
@@ -748,14 +814,23 @@ export function App() {
           <span className="app-name">사진 정리</span>
         </div>
         <div className="titlebar-actions">
+          {(isScanning || isMoving) && (
+            <button className="button button-danger-soft compact" onClick={stopActiveOperation} disabled={isCancelling}>
+              <Stop size={16} weight="fill" />
+              {isCancelling ? "중단 중" : isScanning ? "분석 중단" : "이동 중단"}
+            </button>
+          )}
           <button ref={helpButtonRef} className="button button-secondary compact" onClick={() => setGuide({ kind: "menu", step: 0 })}>
             <Question size={16} weight="bold" />사용법
           </button>
-          <button className="button button-secondary compact" onClick={resetCalculations} disabled={isScanning || isResetting}>
+          <button className="button button-secondary compact" onClick={openCacheDialog}>
+            <Database size={16} />캐시 목록
+          </button>
+          <button className="button button-secondary compact" onClick={resetCalculations} disabled={isScanning || isMoving || isResetting}>
             <ArrowCounterClockwise size={16} />
             {isResetting ? "초기화 중" : "계산값 초기화"}
           </button>
-          <button className="button button-secondary compact" onClick={pickFolder} disabled={isPickingFolder || isScanning}>
+          <button className="button button-secondary compact" onClick={pickFolder} disabled={isPickingFolder || isScanning || isMoving}>
             <FolderOpen size={16} />
             {isPickingFolder ? "선택 중" : "폴더 선택"}
           </button>
@@ -1252,6 +1327,19 @@ export function App() {
         />
       )}
 
+      {isCacheDialogOpen && (
+        <CacheDialog
+          cache={calculationCache}
+          loading={isCacheLoading}
+          resetting={isResetting}
+          canReset={!isScanning && !isMoving}
+          onCancel={() => setIsCacheDialogOpen(false)}
+          onReset={async () => {
+            if (await resetCalculations()) setIsCacheDialogOpen(false);
+          }}
+        />
+      )}
+
       {guide && (
         <GuideOverlay
           guide={guide}
@@ -1302,7 +1390,9 @@ function WelcomeView({
 
 function ScanningView({ session }: { session: Session }) {
   const progress = session.total ? Math.round((session.completed / session.total) * 100) : 0;
-  const phaseLabel = session.phase === "indexing"
+  const phaseLabel = session.phase === "cancelling"
+    ? "사진 분석을 중단하는 중"
+    : session.phase === "indexing"
     ? "사진 촬영일을 확인하는 중"
     : session.phase === "comparing"
       ? session.mode === "quick" ? "매우 비슷한 사진을 찾는 중" : "비슷한 사진을 찾는 중"
@@ -1805,6 +1895,59 @@ function TrashDialog({
         <div className="modal-actions">
           <button className="button button-secondary" onClick={onCancel} disabled={loading}>취소</button>
           <button className="button button-danger" onClick={onConfirm} disabled={loading}><Trash size={16} weight="fill" />{loading ? "옮기는 중" : partial ? "여기까지 이동" : fullyMarkedGroupCount > 0 ? "전부 포함해 이동" : "휴지통으로 이동"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CacheDialog({
+  cache,
+  loading,
+  resetting,
+  canReset,
+  onCancel,
+  onReset,
+}: {
+  cache: CalculationCache | null;
+  loading: boolean;
+  resetting: boolean;
+  canReset: boolean;
+  onCancel: () => void;
+  onReset: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !resetting) onCancel(); }}>
+      <div className="modal cache-modal" role="dialog" aria-modal="true" aria-labelledby="cache-title">
+        <button className="modal-close" aria-label="닫기" onClick={onCancel} disabled={resetting}><X size={18} /></button>
+        <div className="modal-icon cache"><Database size={24} weight="duotone" /></div>
+        <h2 id="cache-title">이미지 계산 캐시</h2>
+        {loading || !cache ? (
+          <p className="cache-loading">캐시 목록을 불러오는 중입니다.</p>
+        ) : (
+          <>
+            <p>
+              분석값 {cache.analysis_entry_count.toLocaleString()}개를 파일명으로 표시합니다.
+              미리보기 {cache.preview_entry_count.toLocaleString()}개와 분석 결과 {cache.session_count.toLocaleString()}건도 메모리에 있습니다.
+            </p>
+            <div className="cache-file-list" role="list" aria-label="캐시된 이미지 계산 파일">
+              {cache.analysis_files.length ? cache.analysis_files.map((file) => (
+                <div className="cache-file-row" role="listitem" key={file.path} title={file.path}>
+                  <ImageSquare size={17} />
+                  <span><strong>{file.name}</strong><small>{file.path}</small></span>
+                  {file.entry_count > 1 && <em>{file.entry_count}</em>}
+                </div>
+              )) : (
+                <div className="cache-empty">저장된 이미지 계산값이 없습니다.</div>
+              )}
+            </div>
+          </>
+        )}
+        <div className="modal-actions">
+          <button className="button button-secondary" onClick={onCancel} disabled={resetting}>닫기</button>
+          <button className="button button-danger-soft" onClick={onReset} disabled={loading || resetting || !canReset}>
+            <ArrowCounterClockwise size={16} />{resetting ? "초기화 중" : "전체 캐시 초기화"}
+          </button>
         </div>
       </div>
     </div>
