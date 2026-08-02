@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 from PIL import Image, ImageDraw
+from pillow_heif import from_pillow
 
 from photo_sorter import core
 from photo_sorter.core import analysis_cache_groups, analyze_image, capture_time, discover_images, discover_videos, scan_folder, similarity
@@ -26,6 +27,11 @@ def save_shifted_image(path: Path, center_x: int) -> None:
     draw.ellipse((center_x - 35, 65, center_x + 35, 135), fill=(220, 80, 60))
     draw.rectangle((20, 20, 75, 55), fill=(50, 130, 210))
     image.save(path, quality=92)
+
+
+def save_heic(path: Path) -> None:
+    image = Image.new("RGB", (240, 180), (26, 93, 142))
+    from_pillow(image).save(path)
 
 
 def set_modified_day(path: Path, day: int) -> None:
@@ -155,6 +161,29 @@ def test_scan_recurses_through_nested_photo_folders(tmp_path: Path) -> None:
         "2023/trip/20240101_120000_photo.jpg",
         "2024/favorites/20240101_120030_photo.jpg",
     ]
+
+
+def test_scan_analyzes_heic_and_heic_content_with_jpg_extension(tmp_path: Path) -> None:
+    heic_path = tmp_path / "20240101_120000_photo.heic"
+    disguised_path = tmp_path / "20240101_120030_photo.jpg"
+    save_heic(heic_path)
+    save_heic(disguised_path)
+
+    result = scan_folder(tmp_path, threshold=88, time_window_seconds=60, max_workers=2)
+
+    assert discover_images(tmp_path) == [heic_path, disguised_path]
+    assert result["stats"]["found"] == 2
+    assert result["stats"]["analyzed"] == 2
+    assert result["failures"] == []
+
+
+def test_discover_images_ignores_macos_appledouble_files(tmp_path: Path) -> None:
+    photo = tmp_path / "photo.jpg"
+    metadata = tmp_path / "._photo.jpg"
+    save_image(photo, (26, 93, 142))
+    metadata.write_bytes(b"AppleDouble metadata")
+
+    assert discover_images(tmp_path) == [photo]
 
 
 def test_scan_combines_multiple_selected_folders(tmp_path: Path) -> None:

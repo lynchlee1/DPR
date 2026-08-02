@@ -12,6 +12,65 @@ StorageMover = Callable[[str, str], object]
 CancelCallback = Callable[[], bool]
 
 
+def inspect_source_directories(result: dict) -> dict:
+    """Count every file still present under the selected source directories."""
+    roots = [
+        Path(folder).expanduser().resolve()
+        for folder in result.get("folders", [result["folder"]])
+    ]
+    directories: list[dict] = []
+    unique_files: set[Path] = set()
+    total_bytes = 0
+    errors: list[dict[str, str]] = []
+
+    for root in roots:
+        file_count = 0
+        size_bytes = 0
+        directory_errors: list[str] = []
+        if not root.is_dir():
+            message = "검사 대상 디렉터리를 찾을 수 없습니다."
+            directory_errors.append(message)
+            errors.append({"path": str(root), "reason": message})
+        else:
+            def record_walk_error(error: OSError) -> None:
+                path = str(error.filename or root)
+                reason = str(error)
+                directory_errors.append(reason)
+                errors.append({"path": path, "reason": reason})
+
+            for current, _, filenames in os.walk(root, onerror=record_walk_error):
+                for filename in filenames:
+                    path = Path(current, filename)
+                    try:
+                        file_size = path.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        reason = str(exc)
+                        directory_errors.append(reason)
+                        errors.append({"path": str(path), "reason": reason})
+                        continue
+                    file_count += 1
+                    size_bytes += file_size
+                    resolved_path = path.resolve()
+                    if resolved_path not in unique_files:
+                        unique_files.add(resolved_path)
+                        total_bytes += file_size
+
+        directories.append({
+            "path": str(root),
+            "file_count": file_count,
+            "size_bytes": size_bytes,
+            "error": directory_errors[0] if directory_errors else None,
+        })
+
+    return {
+        "is_empty": not errors and not unique_files,
+        "file_count": len(unique_files),
+        "size_bytes": total_bytes,
+        "directories": directories,
+        "errors": errors,
+    }
+
+
 def _move_file(source: str, destination: str) -> object:
     # copy2 can fail while applying unsupported metadata to ExFAT after copying the data.
     return shutil.move(source, destination, copy_function=shutil.copyfile)

@@ -386,6 +386,17 @@ def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch
         return {"moved": [], "failures": []}
 
     monkeypatch.setattr(server, "move_selection_to_storage", fake_store)
+    monkeypatch.setattr(
+        server,
+        "inspect_source_directories",
+        lambda result: {
+            "is_empty": True,
+            "file_count": 0,
+            "size_bytes": 0,
+            "directories": [],
+            "errors": [],
+        },
+    )
 
     outcome = server.store_kept(
         session.id,
@@ -395,7 +406,17 @@ def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch
         ),
     )
 
-    assert outcome == {"moved": [], "failures": []}
+    assert outcome == {
+        "moved": [],
+        "failures": [],
+        "source_check": {
+            "is_empty": True,
+            "file_count": 0,
+            "size_bytes": 0,
+            "directories": [],
+            "errors": [],
+        },
+    }
     assert received["result"] is session.result
     assert received["image_ids"] == ["photo-1"]
     assert received["destination"] == tmp_path / "archive"

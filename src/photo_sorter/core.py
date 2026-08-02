@@ -17,9 +17,23 @@ from typing import Callable, Iterable, Literal
 
 import numpy as np
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
+register_heif_opener(thumbnails=False)
+
+SUPPORTED_EXTENSIONS = {
+    ".avif",
+    ".bmp",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 SUPPORTED_VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",
@@ -79,7 +93,11 @@ def discover_images(folder: Path, include_subfolders: bool = True) -> list[Path]
         (
             path
             for path in candidates
-            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            if (
+                path.is_file()
+                and not path.name.startswith("._")
+                and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            )
         ),
         key=lambda path: str(path).casefold(),
     )

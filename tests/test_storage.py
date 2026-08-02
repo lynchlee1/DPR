@@ -4,7 +4,11 @@ import shutil
 
 import pytest
 
-from photo_sorter.storage import move_selection_to_storage, validate_storage_selection
+from photo_sorter.storage import (
+    inspect_source_directories,
+    move_selection_to_storage,
+    validate_storage_selection,
+)
 from photo_sorter.trash import move_selection_to_trash
 
 
@@ -62,6 +66,41 @@ def test_moves_photos_into_capture_date_directories(tmp_path: Path) -> None:
     assert not (source / "second.jpg").exists()
     assert (destination / "Photos" / "20240102" / "first.jpg").read_bytes() == b"first"
     assert (destination / "Photos" / "20240304" / "second.jpg").read_bytes() == b"second"
+
+
+def test_inspects_all_files_remaining_in_source_directories(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    nested = source / "nested"
+    source.mkdir()
+    nested.mkdir()
+    (source / "note.txt").write_bytes(b"note")
+    (nested / "metadata.json").write_bytes(b"metadata")
+
+    check = inspect_source_directories({"folder": str(source)})
+
+    assert check["is_empty"] is False
+    assert check["file_count"] == 2
+    assert check["size_bytes"] == 12
+    assert check["directories"] == [
+        {
+            "path": str(source),
+            "file_count": 2,
+            "size_bytes": 12,
+            "error": None,
+        }
+    ]
+    assert check["errors"] == []
+
+
+def test_source_directory_inspection_confirms_empty_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+
+    check = inspect_source_directories({"folder": str(source)})
+
+    assert check["is_empty"] is True
+    assert check["file_count"] == 0
+    assert check["size_bytes"] == 0
 
 
 def test_moves_photo_from_single_photo_group(tmp_path: Path) -> None:

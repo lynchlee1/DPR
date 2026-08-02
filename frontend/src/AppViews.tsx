@@ -184,6 +184,24 @@ export function StorageCompletionView({
         {destination}/Photos 아래에서 촬영 날짜별 폴더로 확인할 수 있습니다.
         {outcome.failures.length ? ` ${outcome.failures.length.toLocaleString()}장은 원래 위치에 남아 있습니다.` : ""}
       </p>
+      <div className={`source-check ${outcome.source_check.is_empty ? "is-empty" : "has-files"}`}>
+        <ShieldCheck size={20} weight="duotone" aria-hidden="true" />
+        <div>
+          <strong>
+            {outcome.source_check.errors.length
+              ? "원본 디렉터리 검사를 완료하지 못했습니다"
+              : outcome.source_check.is_empty
+                ? "원본 디렉터리가 비어 있습니다"
+                : `원본 디렉터리에 파일 ${outcome.source_check.file_count.toLocaleString()}개가 남아 있습니다`}
+          </strong>
+          <span>남은 용량 {formatBytes(outcome.source_check.size_bytes)}</span>
+          {outcome.source_check.directories.map((directory) => (
+            <small key={directory.path} title={directory.path}>
+              {shortPath(directory.path)} · {directory.file_count.toLocaleString()}개 · {formatBytes(directory.size_bytes)}
+            </small>
+          ))}
+        </div>
+      </div>
       <button className="button button-primary" onClick={onStartOver}>새 폴더 정리</button>
     </div>
   );

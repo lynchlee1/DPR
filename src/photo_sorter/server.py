@@ -32,7 +32,7 @@ from .core import (
     clear_analysis_cache,
     scan_folder,
 )
-from .storage import move_selection_to_storage
+from .storage import inspect_source_directories, move_selection_to_storage
 from .trash import move_selection_to_trash
 
 
@@ -114,7 +114,7 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.1.2")
+app = FastAPI(title="사진 정리", version="1.1.3")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
@@ -594,12 +594,14 @@ def store_kept(scan_id: str, request: StoreRequest) -> dict:
         session.cancel_event.clear()
         session.active_operation = "store"
     try:
-        return move_selection_to_storage(
+        outcome = move_selection_to_storage(
             session.result,
             request.image_ids,
             Path(request.destination),
             should_cancel=session.cancel_event.is_set,
         )
+        outcome["source_check"] = inspect_source_directories(session.result)
+        return outcome
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:

@@ -28,7 +28,7 @@ import {
 } from "./AppViews";
 import { CacheDialog, FolderBrowserDialog, StorageDialog, TrashDialog } from "./AppDialogs";
 import { ReviewWorkspace } from "./ReviewWorkspace";
-import { formatSelectedPeriod, imageUrl, shortPath } from "./appUtils";
+import { formatBytes, formatSelectedPeriod, imageUrl, shortPath } from "./appUtils";
 import { useAppController } from "./useAppController";
 import { ARROW_REPEAT_INTERVAL_KEY, CLEANUP_JSON_KEY } from "./appConstants";
 
@@ -61,7 +61,7 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <header className="titlebar">
+      <header className={`titlebar ${activeStatus ? "is-active" : ""}`}>
         <div className="app-identity">
           <span className="app-mark"><ImageSquare size={19} weight="fill" /></span>
           <span className="app-name">사진 정리</span>
@@ -69,7 +69,7 @@ export function App() {
         {activeStatus && (
           <div className="active-status" role="status" aria-live="polite">
             <CircleNotch className="active-status-spinner" size={16} weight="bold" aria-hidden="true" />
-            <span>{activeStatus}</span>
+            <span className="active-status-copy"><small>실행 중</small><span>{activeStatus}</span></span>
             {isScanning && session?.total ? (
               <strong>{Math.round((session.completed / session.total) * 100)}%</strong>
             ) : null}
@@ -123,6 +123,11 @@ export function App() {
               보관 사진 {storageOutcome.moved.length.toLocaleString()}장을 촬영일 폴더로 옮겼습니다.
               {storageOutcome.failures.length ? ` ${storageOutcome.failures.length.toLocaleString()}장은 옮기지 못했습니다.` : ""}
               {` 남은 ${result.groups.length.toLocaleString()}개 그룹을 계속 검토할 수 있습니다.`}
+              {storageOutcome.source_check.errors.length
+                ? " 원본 디렉터리 잔여 파일 검사를 완료하지 못했습니다."
+                : storageOutcome.source_check.is_empty
+                  ? " 원본 디렉터리에 남은 파일이 없습니다."
+                  : ` 원본 디렉터리 잔여 ${storageOutcome.source_check.file_count.toLocaleString()}개 · ${formatBytes(storageOutcome.source_check.size_bytes)}`}
             </span>
             {storageOutcome.failures[0] && (
               <small title={`${storageOutcome.failures[0].path}${storageOutcome.failures[0].destination ? ` → ${storageOutcome.failures[0].destination}` : ""}`}>

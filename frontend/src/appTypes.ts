@@ -107,6 +107,18 @@ export type StorageOutcome = {
   moved: { source: string; destination: string }[];
   failures: { path: string; destination?: string; reason: string }[];
   cancelled?: boolean;
+  source_check: {
+    is_empty: boolean;
+    file_count: number;
+    size_bytes: number;
+    directories: {
+      path: string;
+      file_count: number;
+      size_bytes: number;
+      error: string | null;
+    }[];
+    errors: { path: string; reason: string }[];
+  };
 };
 
 export type CalculationCache = {
