@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
 import gc
@@ -44,7 +45,8 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
 
 class ScanRequest(BaseModel):
-    folder: str = Field(min_length=1)
+    folder: str = ""
+    folders: list[str] = Field(default_factory=list)
     threshold: float = Field(default=88, ge=0, le=100)
     time_window_seconds: int = Field(default=60, ge=1, le=3600)
     mode: Literal["standard", "quick"] = "standard"
@@ -70,6 +72,7 @@ class ScanSession:
     folder: str
     threshold: float
     time_window_seconds: int
+    folders: list[str] = field(default_factory=list)
     mode: Literal["standard", "quick"] = "standard"
     include_subfolders: bool = True
     day_limit: int | None = None
@@ -92,6 +95,7 @@ class ScanSession:
         return {
             "id": self.id,
             "folder": self.folder,
+            "folders": self.folders or [self.folder],
             "threshold": self.threshold,
             "time_window_seconds": self.time_window_seconds,
             "mode": self.mode,
@@ -110,39 +114,44 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.0.3")
+app = FastAPI(title="사진 정리", version="1.0.4")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
 )
 sessions: dict[str, ScanSession] = {}
 sessions_lock = threading.Lock()
+PREVIEW_CACHE_MAX_SIZE = 512
+_preview_cache_keys: OrderedDict[tuple[str, int, int], tuple[str, int]] = OrderedDict()
+_preview_cache_lock = threading.Lock()
 
 
 def _source_signature(
-    folder: Path,
+    folder: Path | list[Path],
     include_subfolders: bool,
     include_json: bool,
 ) -> tuple[tuple[str, int, int], ...]:
-    candidates = folder.rglob("*") if include_subfolders else folder.iterdir()
+    folders = folder if isinstance(folder, list) else [folder]
     supported = SUPPORTED_EXTENSIONS | SUPPORTED_VIDEO_EXTENSIONS
     if include_json:
         supported = supported | {".json"}
     signature: list[tuple[str, int, int]] = []
-    for path in candidates:
-        if not path.is_file() or path.suffix.lower() not in supported:
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+    for source_folder in folders:
+        candidates = source_folder.rglob("*") if include_subfolders else source_folder.iterdir()
+        for path in candidates:
+            if not path.is_file() or path.suffix.lower() not in supported:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
     return tuple(sorted(signature))
 
 
-def _same_scan(session: ScanSession, request: ScanRequest, folder: Path) -> bool:
+def _same_scan(session: ScanSession, request: ScanRequest, folders: list[Path]) -> bool:
     return (
-        session.folder == str(folder)
+        (session.folders or [session.folder]) == [str(folder) for folder in folders]
         and session.threshold == request.threshold
         and session.time_window_seconds == request.time_window_seconds
         and session.mode == request.mode
@@ -176,7 +185,7 @@ def _run_scan(session: ScanSession) -> None:
         session.active_operation = "scan"
     try:
         result = scan_folder(
-            Path(session.folder),
+            [Path(folder) for folder in (session.folders or [session.folder])],
             threshold=session.threshold,
             time_window_seconds=session.time_window_seconds,
             on_progress=lambda completed, total, phase: _update_progress(session, completed, total, phase),
@@ -189,7 +198,7 @@ def _run_scan(session: ScanSession) -> None:
             should_cancel=session.cancel_event.is_set,
         )
         signature = _source_signature(
-            Path(session.folder),
+            [Path(folder) for folder in (session.folders or [session.folder])],
             session.include_subfolders,
             session.cleanup_json_files,
         )
@@ -232,7 +241,7 @@ def _image_path(session: ScanSession, image_id: str) -> Path:
     raise HTTPException(status_code=404, detail="사진을 찾을 수 없습니다.")
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=PREVIEW_CACHE_MAX_SIZE)
 def _render_image(path_text: str, modified_ns: int, max_edge: int) -> bytes:
     del modified_ns  # Included in the cache key so replaced files invalidate naturally.
     path = Path(path_text)
@@ -242,6 +251,21 @@ def _render_image(path_text: str, modified_ns: int, max_edge: int) -> bytes:
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=86, optimize=True)
         return output.getvalue()
+
+
+def _deep_size(value: object, seen: set[int] | None = None) -> int:
+    """Estimate retained Python memory without counting shared objects twice."""
+    seen = seen or set()
+    value_id = id(value)
+    if value_id in seen:
+        return 0
+    seen.add(value_id)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        size += sum(_deep_size(key, seen) + _deep_size(item, seen) for key, item in value.items())
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        size += sum(_deep_size(item, seen) for item in value)
+    return size
 
 
 @app.get("/api/health")
@@ -266,6 +290,8 @@ def reset_calculations() -> dict:
     cleared_analysis_entries = clear_analysis_cache()
     cleared_preview_entries = _render_image.cache_info().currsize
     _render_image.cache_clear()
+    with _preview_cache_lock:
+        _preview_cache_keys.clear()
     gc.collect()
     return {
         "cleared_sessions": cleared_sessions,
@@ -276,20 +302,84 @@ def reset_calculations() -> dict:
 
 @app.get("/api/calculations/cache")
 def get_calculation_cache() -> dict:
-    groups = analysis_cache_groups()
+    usage_by_folder: dict[str, dict[str, int]] = {}
+
+    def usage_for(folder_text: str) -> dict[str, int]:
+        return usage_by_folder.setdefault(folder_text, {
+            "analysis_count": 0,
+            "analysis_bytes": 0,
+            "preview_count": 0,
+            "preview_bytes": 0,
+            "result_count": 0,
+            "result_bytes": 0,
+        })
+
+    for group in analysis_cache_groups():
+        usage = usage_for(group["path"])
+        usage["analysis_count"] += group["entry_count"]
+        usage["analysis_bytes"] += group["estimated_bytes"]
+
+    with _preview_cache_lock:
+        preview_entries = list(_preview_cache_keys.values())
+    for folder_text, byte_count in preview_entries:
+        usage = usage_for(folder_text)
+        usage["preview_count"] += 1
+        usage["preview_bytes"] += byte_count
+
     with sessions_lock:
-        session_count = len(sessions)
+        session_snapshot = list(sessions.values())
+    for session in session_snapshot:
+        if session.result is None:
+            continue
+        result_bytes = _deep_size(session.result)
+        images = [image for group in session.result.get("groups", []) for image in group.get("images", [])]
+        weights_by_folder: dict[str, int] = {}
+        counts_by_folder: dict[str, int] = {}
+        for image in images:
+            folder_text = str(Path(image["path"]).parent)
+            weights_by_folder[folder_text] = weights_by_folder.get(folder_text, 0) + _deep_size(image)
+            counts_by_folder[folder_text] = counts_by_folder.get(folder_text, 0) + 1
+        if not weights_by_folder:
+            usage_for(session.folder)["result_bytes"] += result_bytes
+            continue
+        total_weight = sum(weights_by_folder.values())
+        remaining_bytes = result_bytes
+        folders = list(weights_by_folder)
+        for index, folder_text in enumerate(folders):
+            allocated = (
+                remaining_bytes
+                if index == len(folders) - 1
+                else result_bytes * weights_by_folder[folder_text] // total_weight
+            )
+            remaining_bytes -= allocated
+            usage = usage_for(folder_text)
+            usage["result_count"] += counts_by_folder[folder_text]
+            usage["result_bytes"] += allocated
+
+    groups = []
+    for folder_text, usage in usage_by_folder.items():
+        total_bytes = usage["analysis_bytes"] + usage["preview_bytes"] + usage["result_bytes"]
+        groups.append({
+            "name": Path(folder_text).name or folder_text,
+            "path": folder_text,
+            "total_bytes": total_bytes,
+            **usage,
+        })
+    groups.sort(key=lambda group: (-group["total_bytes"], group["path"].casefold()))
     return {
-        "analysis_entry_count": sum(group["entry_count"] for group in groups),
-        "analysis_groups": groups,
-        "preview_entry_count": _render_image.cache_info().currsize,
-        "session_count": session_count,
+        "total_bytes": sum(group["total_bytes"] for group in groups),
+        "analysis_entry_count": sum(group["analysis_count"] for group in groups),
+        "preview_entry_count": sum(group["preview_count"] for group in groups),
+        "result_entry_count": sum(group["result_count"] for group in groups),
+        "session_count": len(session_snapshot),
+        "groups": groups,
     }
 
 
 @app.post("/api/folders/pick")
 def pick_folder(
-    purpose: Literal["source", "destination"] = Query(default="source"),
+    purpose: Literal["source", "destination"] = "source",
+    multiple: bool = False,
 ) -> dict:
     prompt = (
         "보관 사진을 저장할 폴더를 선택하세요"
@@ -297,7 +387,17 @@ def pick_folder(
         else "정리할 사진 폴더를 선택하세요"
     )
     if platform.system() == "Darwin":
-        script = f'POSIX path of (choose folder with prompt "{prompt}")'
+        if purpose == "source" and multiple:
+            script = (
+                f'set selectedFolders to choose folder with prompt "{prompt}" with multiple selections allowed\n'
+                'set selectedPaths to ""\n'
+                'repeat with selectedFolder in selectedFolders\n'
+                'set selectedPaths to selectedPaths & POSIX path of selectedFolder & linefeed\n'
+                'end repeat\n'
+                'return selectedPaths'
+            )
+        else:
+            script = f'POSIX path of (choose folder with prompt "{prompt}")'
         # The executable and AppleScript are fixed, with no shell involved.
         completed = subprocess.run(  # nosec B603
             ["/usr/bin/osascript", "-e", script],
@@ -307,8 +407,9 @@ def pick_folder(
             check=False,
         )
         if completed.returncode != 0:
-            return {"path": None}
-        return {"path": completed.stdout.strip().rstrip("/")}
+            return {"path": None, "paths": []}
+        paths = [line.rstrip("/") for line in completed.stdout.splitlines() if line.strip()]
+        return {"path": paths[0] if paths else None, "paths": paths}
 
     try:
         import tkinter as tk
@@ -318,18 +419,63 @@ def pick_folder(
         root.withdraw()
         path = filedialog.askdirectory(title=prompt)
         root.destroy()
-        return {"path": path or None}
+        return {"path": path or None, "paths": [path] if path else []}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"폴더 선택기를 열 수 없습니다: {exc}") from exc
 
 
+@app.get("/api/folders/browse")
+def browse_folders(path: str | None = Query(default=None)) -> dict:
+    target = Path(path).expanduser().resolve() if path else Path.home().resolve()
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="존재하는 폴더를 열어 주세요.")
+
+    try:
+        folders = sorted(
+            (
+                {"name": child.name, "path": str(child.resolve())}
+                for child in target.iterdir()
+                if child.is_dir() and not child.name.startswith(".")
+            ),
+            key=lambda item: item["name"].casefold(),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="이 폴더를 열 권한이 없습니다.") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"폴더를 열 수 없습니다: {exc}") from exc
+
+    home = Path.home().resolve()
+    shortcut_candidates = [
+        ("홈", home),
+        ("사진", home / "Pictures"),
+        ("다운로드", home / "Downloads"),
+        ("문서", home / "Documents"),
+    ]
+    shortcuts = [
+        {"name": name, "path": str(shortcut.resolve())}
+        for name, shortcut in shortcut_candidates
+        if shortcut.is_dir()
+    ]
+    parent = target.parent
+    return {
+        "path": str(target),
+        "parent": str(parent) if parent != target else None,
+        "folders": folders,
+        "shortcuts": shortcuts,
+    }
+
+
 @app.post("/api/scans", status_code=202)
 def create_scan(request: ScanRequest) -> dict:
-    folder = Path(request.folder).expanduser().resolve()
-    if not folder.is_dir():
-        raise HTTPException(status_code=400, detail="존재하는 폴더를 선택해 주세요.")
+    requested_folders = request.folders or ([request.folder] if request.folder else [])
+    folders = list(dict.fromkeys(Path(folder).expanduser().resolve() for folder in requested_folders))
+    if not folders:
+        raise HTTPException(status_code=400, detail="분석할 폴더를 선택해 주세요.")
+    if any(not folder.is_dir() for folder in folders):
+        raise HTTPException(status_code=400, detail="선택한 폴더 중 존재하지 않는 폴더가 있습니다.")
+    folder = folders[0]
 
-    signature = _source_signature(folder, request.include_subfolders, request.cleanup_json_files)
+    signature = _source_signature(folders, request.include_subfolders, request.cleanup_json_files)
     with sessions_lock:
         reusable = next(
             (
@@ -338,7 +484,7 @@ def create_scan(request: ScanRequest) -> dict:
                 if existing.status == "complete"
                 and existing.result is not None
                 and existing.source_signature == signature
-                and _same_scan(existing, request, folder)
+                and _same_scan(existing, request, folders)
             ),
             None,
         )
@@ -350,6 +496,7 @@ def create_scan(request: ScanRequest) -> dict:
     session = ScanSession(
         id=uuid.uuid4().hex[:12],
         folder=str(folder),
+        folders=[str(item) for item in folders],
         threshold=request.threshold,
         time_window_seconds=request.time_window_seconds,
         mode=request.mode,
@@ -396,7 +543,13 @@ def get_image(
     if not path.is_file():
         raise HTTPException(status_code=404, detail="원본 사진을 찾을 수 없습니다.")
     max_edge = 320 if size == "thumb" else 1400
-    data = _render_image(str(path), path.stat().st_mtime_ns, max_edge)
+    cache_key = (str(path), path.stat().st_mtime_ns, max_edge)
+    data = _render_image(*cache_key)
+    with _preview_cache_lock:
+        _preview_cache_keys.pop(cache_key, None)
+        _preview_cache_keys[cache_key] = (str(path.parent), len(data))
+        while len(_preview_cache_keys) > PREVIEW_CACHE_MAX_SIZE:
+            _preview_cache_keys.popitem(last=False)
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 

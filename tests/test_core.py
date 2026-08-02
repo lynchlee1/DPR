@@ -157,6 +157,26 @@ def test_scan_recurses_through_nested_photo_folders(tmp_path: Path) -> None:
     ]
 
 
+def test_scan_combines_multiple_selected_folders(tmp_path: Path) -> None:
+    first_folder = tmp_path / "camera"
+    second_folder = tmp_path / "phone"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    save_image(first_folder / "20240101_120000_photo.jpg", (26, 93, 142))
+    save_image(second_folder / "20240101_120030_photo.jpg", (26, 93, 142))
+
+    result = scan_folder([first_folder, second_folder], threshold=88, max_workers=2)
+
+    assert result["folders"] == [str(first_folder), str(second_folder)]
+    assert result["stats"]["found"] == 2
+    assert result["stats"]["groups"] == 1
+    assert result["groups"][0]["folder_count"] == 2
+    assert [image["relative_path"] for image in result["groups"][0]["images"]] == [
+        "camera/20240101_120000_photo.jpg",
+        "phone/20240101_120030_photo.jpg",
+    ]
+
+
 def test_scan_can_exclude_nested_photo_folders(tmp_path: Path) -> None:
     nested_folder = tmp_path / "nested"
     nested_folder.mkdir()
@@ -332,7 +352,7 @@ def test_clear_analysis_cache_discards_cached_records(tmp_path: Path) -> None:
     assert second is not first
 
 
-def test_analysis_cache_entries_are_grouped_by_scanned_folder(tmp_path: Path) -> None:
+def test_analysis_cache_entries_are_grouped_by_real_parent_folder(tmp_path: Path) -> None:
     first_path = tmp_path / "first-photo.jpg"
     second_path = tmp_path / "nested" / "second-photo.jpg"
     second_path.parent.mkdir()
@@ -344,15 +364,12 @@ def test_analysis_cache_entries_are_grouped_by_scanned_folder(tmp_path: Path) ->
     analyze_image(first_path, cache_folder=tmp_path)
     analyze_image(first_path, cache_folder=tmp_path)
 
-    assert analysis_cache_groups() == [
-        {"name": tmp_path.name, "path": str(tmp_path), "entry_count": 2},
-    ]
-
-    analyze_image(second_path, cache_folder=second_path.parent)
-    assert analysis_cache_groups() == [
+    groups = analysis_cache_groups()
+    assert [{key: group[key] for key in ("name", "path", "entry_count")} for group in groups] == [
         {"name": tmp_path.name, "path": str(tmp_path), "entry_count": 1},
         {"name": "nested", "path": str(second_path.parent), "entry_count": 1},
     ]
+    assert all(group["estimated_bytes"] > 0 for group in groups)
 
     core.clear_analysis_cache()
     assert analysis_cache_groups() == []

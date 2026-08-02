@@ -5,8 +5,10 @@ import {
   ArrowRight,
   ArrowUp,
   CaretDown,
+  CaretRight,
   Check,
   CheckCircle,
+  CircleNotch,
   Database,
   FolderOpen,
   ImageSquare,
@@ -70,6 +72,7 @@ type PhotoGroup = {
 
 type ScanResult = {
   folder: string;
+  folders?: string[];
   threshold: number;
   time_window_seconds: number;
   keeper_strategy: "quality" | "latest";
@@ -104,6 +107,7 @@ type ScanResult = {
 type Session = {
   id: string;
   folder: string;
+  folders?: string[];
   threshold: number;
   time_window_seconds: number;
   mode: AnalysisMode;
@@ -135,10 +139,29 @@ type StorageOutcome = {
 };
 
 type CalculationCache = {
+  total_bytes: number;
   analysis_entry_count: number;
-  analysis_groups: { name: string; path: string; entry_count: number }[];
   preview_entry_count: number;
+  result_entry_count: number;
   session_count: number;
+  groups: {
+    name: string;
+    path: string;
+    total_bytes: number;
+    analysis_count: number;
+    analysis_bytes: number;
+    preview_count: number;
+    preview_bytes: number;
+    result_count: number;
+    result_bytes: number;
+  }[];
+};
+
+type FolderBrowserData = {
+  path: string;
+  parent: string | null;
+  folders: { name: string; path: string }[];
+  shortcuts: { name: string; path: string }[];
 };
 
 function formatBytes(bytes: number): string {
@@ -268,6 +291,15 @@ function removeMovedPhotos(result: ScanResult, movedPaths: string[]): ScanResult
 
 export function App() {
   const [folder, setFolder] = useState(() => localStorage.getItem("photo-sorter-folder") || "");
+  const [folders, setFolders] = useState<string[]>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem("photo-sorter-folders") || "[]");
+      if (Array.isArray(stored) && stored.every((item) => typeof item === "string")) return stored;
+    } catch {
+      // Fall back to the legacy single-folder preference.
+    }
+    return folder ? [folder] : [];
+  });
   const [destination, setDestination] = useState(() => localStorage.getItem("photo-sorter-destination") || "");
   const [threshold, setThreshold] = useState(88);
   const [quickThreshold, setQuickThreshold] = useState(DEFAULT_QUICK_THRESHOLD);
@@ -296,7 +328,7 @@ export function App() {
   const [result, setResult] = useState<ScanResult | null>(null);
   const [selectedGroupIndex, setSelectedGroupIndex] = useState(0);
   const [selectedPhotoId, setSelectedPhotoId] = useState<string | null>(null);
-  const [isPickingFolder, setIsPickingFolder] = useState(false);
+  const [isFolderBrowserOpen, setIsFolderBrowserOpen] = useState(false);
   const [isPickingDestination, setIsPickingDestination] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [resetNotice, setResetNotice] = useState<string | null>(null);
@@ -320,6 +352,20 @@ export function App() {
 
   const isScanning = session?.status === "queued" || session?.status === "running" || session?.status === "cancelling";
   const isMoving = isStoring || isTrashing;
+  const selectedFolders = folders.length > 0 ? folders : folder.trim() ? [folder.trim()] : [];
+  const activeStatus = isCancelling
+    ? "작업을 중단하는 중"
+    : isStoring
+      ? "보관 사진을 이동하는 중"
+      : isTrashing
+        ? "선택한 사진을 휴지통으로 이동하는 중"
+        : isScanning
+          ? session?.phase === "indexing"
+            ? "사진 촬영일을 확인하는 중"
+            : session?.phase === "comparing"
+              ? "비슷한 사진을 비교하는 중"
+              : "사진을 분석하는 중"
+          : null;
   const visibleGroups = useMemo(
     () => filterReviewGroups(result?.groups ?? [], showSingletons),
     [result, showSingletons],
@@ -472,24 +518,59 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
-  async function pickFolder() {
-    setIsPickingFolder(true);
-    setError(null);
-    try {
-      const picked = await api<{ path: string | null }>("/api/folders/pick", { method: "POST" });
-      if (picked.path) {
-        setFolder(picked.path);
-        localStorage.setItem("photo-sorter-folder", picked.path);
-        setResult(null);
-        setSession(null);
-        setCleanupOutcome(null);
-        setStorageOutcome(null);
-      }
-    } catch (pickError) {
-      setError(pickError instanceof Error ? pickError.message : "폴더를 선택하지 못했습니다.");
-    } finally {
-      setIsPickingFolder(false);
+  function updateManualFolder(value: string) {
+    setFolder(value);
+    const nextFolders = value.trim() ? [value.trim()] : [];
+    setFolders(nextFolders);
+    if (nextFolders.length) {
+      localStorage.setItem("photo-sorter-folder", nextFolders[0]);
+      localStorage.setItem("photo-sorter-folders", JSON.stringify(nextFolders));
+    } else {
+      localStorage.removeItem("photo-sorter-folder");
+      localStorage.removeItem("photo-sorter-folders");
     }
+  }
+
+  function removeFolder(path: string) {
+    const nextFolders = selectedFolders.filter((item) => item !== path);
+    setFolders(nextFolders);
+    setFolder(nextFolders[0] || "");
+    if (nextFolders.length) {
+      localStorage.setItem("photo-sorter-folder", nextFolders[0]);
+      localStorage.setItem("photo-sorter-folders", JSON.stringify(nextFolders));
+    } else {
+      localStorage.removeItem("photo-sorter-folder");
+      localStorage.removeItem("photo-sorter-folders");
+    }
+    setResult(null);
+    setSession(null);
+  }
+
+  function clearFolders() {
+    setFolders([]);
+    setFolder("");
+    localStorage.removeItem("photo-sorter-folder");
+    localStorage.removeItem("photo-sorter-folders");
+    setResult(null);
+    setSession(null);
+  }
+
+  function applyFolders(nextFolders: string[]) {
+    const uniqueFolders = [...new Set(nextFolders)];
+    setFolders(uniqueFolders);
+    setFolder(uniqueFolders[0] || "");
+    if (uniqueFolders.length) {
+      localStorage.setItem("photo-sorter-folder", uniqueFolders[0]);
+      localStorage.setItem("photo-sorter-folders", JSON.stringify(uniqueFolders));
+    } else {
+      localStorage.removeItem("photo-sorter-folder");
+      localStorage.removeItem("photo-sorter-folders");
+    }
+    setResult(null);
+    setSession(null);
+    setCleanupOutcome(null);
+    setStorageOutcome(null);
+    setIsFolderBrowserOpen(false);
   }
 
   async function pickDestination() {
@@ -564,11 +645,13 @@ export function App() {
       return;
     }
     try {
-      localStorage.setItem("photo-sorter-folder", folder);
+      localStorage.setItem("photo-sorter-folder", selectedFolders[0]);
+      localStorage.setItem("photo-sorter-folders", JSON.stringify(selectedFolders));
       const next = await api<Session>("/api/scans", {
         method: "POST",
         body: JSON.stringify({
           folder,
+          folders: selectedFolders,
           threshold: activeThreshold,
           time_window_seconds: 60,
           mode: analysisMode,
@@ -813,6 +896,15 @@ export function App() {
           <span className="app-mark"><ImageSquare size={19} weight="fill" /></span>
           <span className="app-name">사진 정리</span>
         </div>
+        {activeStatus && (
+          <div className="active-status" role="status" aria-live="polite">
+            <CircleNotch className="active-status-spinner" size={16} weight="bold" aria-hidden="true" />
+            <span>{activeStatus}</span>
+            {isScanning && session?.total ? (
+              <strong>{Math.round((session.completed / session.total) * 100)}%</strong>
+            ) : null}
+          </div>
+        )}
         <div className="titlebar-actions">
           {(isScanning || isMoving) && (
             <button className="button button-danger-soft compact" onClick={stopActiveOperation} disabled={isCancelling}>
@@ -830,9 +922,9 @@ export function App() {
             <ArrowCounterClockwise size={16} />
             {isResetting ? "초기화 중" : "계산값 초기화"}
           </button>
-          <button className="button button-secondary compact" onClick={pickFolder} disabled={isPickingFolder || isScanning || isMoving}>
+          <button className="button button-secondary compact" onClick={() => setIsFolderBrowserOpen(true)} disabled={isScanning || isMoving}>
             <FolderOpen size={16} />
-            {isPickingFolder ? "선택 중" : "폴더 선택"}
+            폴더 선택
           </button>
         </div>
       </header>
@@ -903,14 +995,34 @@ export function App() {
               <input
                 id="folder-path"
                 value={folder}
-                onChange={(event) => setFolder(event.target.value)}
+                onChange={(event) => updateManualFolder(event.target.value)}
                 spellCheck={false}
                 disabled={isScanning}
               />
-              <button className="icon-button" aria-label="폴더 선택" onClick={pickFolder} disabled={isScanning}>
+              <button className="icon-button" aria-label="앱에서 폴더 선택" onClick={() => setIsFolderBrowserOpen(true)} disabled={isScanning}>
                 <FolderOpen size={18} />
               </button>
             </div>
+            <button className="folder-browser-trigger" type="button" onClick={() => setIsFolderBrowserOpen(true)} disabled={isScanning}>
+              <FolderOpen size={15} />앱에서 여러 폴더 선택
+            </button>
+            {selectedFolders.length > 0 && (
+              <div className="selected-folders" aria-label={`선택한 폴더 ${selectedFolders.length}개`}>
+                <div className="selected-folders-heading">
+                  <span>{selectedFolders.length}개 폴더 선택됨</span>
+                  <button type="button" onClick={clearFolders} disabled={isScanning}>전체 해제</button>
+                </div>
+                {selectedFolders.map((path) => (
+                  <div className="selected-folder" key={path} title={path}>
+                    <FolderOpen size={14} aria-hidden="true" />
+                    <span>{shortPath(path)}</span>
+                    <button type="button" aria-label={`${path} 선택 해제`} onClick={() => removeFolder(path)} disabled={isScanning}>
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <label className="field-label destination-label" htmlFor="destination-path">보관 저장 위치</label>
             <div className="path-input-row">
@@ -1187,7 +1299,7 @@ export function App() {
               </div>
             )}
 
-            <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || !folder.trim() || !isDayLimitValid} data-guide="scan">
+            <button className="button button-primary scan-button" onClick={startScan} disabled={isScanning || selectedFolders.length === 0 || !isDayLimitValid} data-guide="scan">
               {analysisMode === "quick" ? <Lightning size={17} weight="fill" /> : <Sparkle size={17} weight="fill" />}
               {isScanning ? "분석 중" : analysisMode === "quick" ? "빠른 분석 시작" : result ? "다시 분석" : "사진 분석"}
             </button>
@@ -1293,9 +1405,9 @@ export function App() {
             />
           ) : (
             <WelcomeView
-              onChoose={pickFolder}
+              onChoose={() => setIsFolderBrowserOpen(true)}
               onScan={startScan}
-              folder={folder}
+              folderCount={selectedFolders.length}
               mode={analysisMode}
               threshold={activeThreshold}
               includeSubfolders={includeSubfolders}
@@ -1313,6 +1425,14 @@ export function App() {
           loading={isTrashing}
           onCancel={() => { setIsTrashDialogOpen(false); setTrashThroughGroupIndex(null); }}
           onConfirm={trashMarked}
+        />
+      )}
+
+      {isFolderBrowserOpen && (
+        <FolderBrowserDialog
+          initialSelected={selectedFolders}
+          onCancel={() => setIsFolderBrowserOpen(false)}
+          onConfirm={applyFolders}
         />
       )}
 
@@ -1355,14 +1475,14 @@ export function App() {
 function WelcomeView({
   onChoose,
   onScan,
-  folder,
+  folderCount,
   mode,
   threshold,
   includeSubfolders,
 }: {
   onChoose: () => void;
   onScan: () => void;
-  folder: string;
+  folderCount: number;
   mode: AnalysisMode;
   threshold: number;
   includeSubfolders: boolean;
@@ -1373,14 +1493,14 @@ function WelcomeView({
       <h1>{mode === "quick" ? "매우 비슷한 사진부터 빠르게 검토하세요" : "비슷한 사진을 안전하게 정리하세요"}</h1>
       <p>{mode === "quick" ? `${threshold}% 이상 비슷한 사진을 모아 보관할 사진을 추천하고, 나머지는 삭제 후보로 준비합니다. 휴지통으로 옮기기 전에 선택을 직접 확인할 수 있습니다.` : "선택한 폴더 안에서 비슷한 사진을 찾아 한눈에 비교할 수 있도록 모아 보여줍니다. 사진은 외부로 전송되지 않으며, 삭제 후보는 직접 선택합니다."}</p>
       <div className="welcome-actions">
-        <button className="button button-secondary" onClick={onChoose}><FolderOpen size={17} />다른 폴더 선택</button>
-        <button className="button button-primary" onClick={onScan} disabled={!folder}>
+        <button className="button button-secondary" onClick={onChoose}><FolderOpen size={17} />폴더 추가 선택</button>
+        <button className="button button-primary" onClick={onScan} disabled={!folderCount}>
           {mode === "quick" ? <Lightning size={17} weight="fill" /> : <Sparkle size={17} weight="fill" />}
           {mode === "quick" ? "빠른 분석" : "분석 시작"}
         </button>
       </div>
       <div className="workflow-notes">
-        <div><span>1</span><strong>사진 찾기</strong><small>{includeSubfolders ? "하위 폴더 포함" : "선택한 폴더만"}</small></div>
+        <div><span>1</span><strong>사진 찾기</strong><small>{folderCount > 1 ? `${folderCount}개 폴더` : includeSubfolders ? "하위 폴더 포함" : "선택한 폴더만"}</small></div>
         <div><span>2</span><strong>유사 사진 모으기</strong><small>한눈에 비교</small></div>
         <div><span>3</span><strong>확인 후 정리</strong><small>휴지통으로 이동</small></div>
       </div>
@@ -1401,11 +1521,13 @@ function ScanningView({ session }: { session: Session }) {
     <div className="scanning-view" aria-live="polite">
       <div className="scan-status-row">
         <div className="scan-icon">{session.mode === "quick" ? <Lightning size={22} weight="fill" /> : <MagnifyingGlass size={22} />}</div>
-        <div><h1>{phaseLabel}</h1><p>{shortPath(session.folder)}</p></div>
+        <div><h1>{phaseLabel}</h1><p>{session.folders && session.folders.length > 1 ? `${session.folders.length}개 폴더를 함께 분석 중` : shortPath(session.folder)}</p></div>
         <strong>{progress}%</strong>
       </div>
-      <div className="progress-track"><span style={{ transform: `scaleX(${progress / 100})` }} /></div>
-      <p className="progress-detail">{session.completed.toLocaleString()} / {session.total.toLocaleString()} 처리</p>
+      <div className={`progress-track ${session.total ? "" : "indeterminate"}`}>
+        <span style={session.total ? { transform: `scaleX(${progress / 100})` } : undefined} />
+      </div>
+      <p className="progress-detail">{session.total ? `${session.completed.toLocaleString()} / ${session.total.toLocaleString()} 처리` : "분석할 파일을 확인하고 있습니다"}</p>
       {session.selected_date_start && session.selected_date_end && (
         <div className="scan-period">
           <span>선정된 분석 기간</span>
@@ -1927,18 +2049,29 @@ function CacheDialog({
         ) : (
           <>
             <p>
-              분석값 {cache.analysis_entry_count.toLocaleString()}개를 검사한 폴더 {cache.analysis_groups.length.toLocaleString()}개 묶음으로 표시합니다.
-              미리보기 {cache.preview_entry_count.toLocaleString()}개와 분석 결과 {cache.session_count.toLocaleString()}건도 메모리에 있습니다.
+              현재 확인 가능한 메모리 사용량은 약 {formatBytes(cache.total_bytes)}입니다.
+              실제 파일 위치별로 분석값, 미리보기와 완료된 분석 결과를 모두 합산했습니다.
             </p>
-            <div className="cache-group-list" role="list" aria-label="검사 폴더별 이미지 계산 캐시">
-              {cache.analysis_groups.length ? cache.analysis_groups.map((group) => (
+            <div className="cache-summary" aria-label="메모리 항목 요약">
+              <span>분석값 <strong>{cache.analysis_entry_count.toLocaleString()}</strong></span>
+              <span>미리보기 <strong>{cache.preview_entry_count.toLocaleString()}</strong></span>
+              <span>결과 사진 <strong>{cache.result_entry_count.toLocaleString()}</strong></span>
+            </div>
+            <div className="cache-group-list" role="list" aria-label="실제 폴더별 메모리 사용량">
+              {cache.groups.length ? cache.groups.map((group) => (
                 <div className="cache-group-row" role="listitem" key={group.path} title={group.path}>
                   <FolderOpen size={17} />
-                  <span><strong>{group.name}</strong><small>{group.path}</small></span>
-                  <em>{group.entry_count.toLocaleString()}개</em>
+                  <span>
+                    <strong>{group.name}</strong>
+                    <small>{group.path}</small>
+                    <small className="cache-breakdown">
+                      분석 {group.analysis_count.toLocaleString()} · 미리보기 {group.preview_count.toLocaleString()} · 결과 {group.result_count.toLocaleString()}
+                    </small>
+                  </span>
+                  <em>{formatBytes(group.total_bytes)}</em>
                 </div>
               )) : (
-                <div className="cache-empty">검사 폴더의 이미지 계산값이 없습니다.</div>
+                <div className="cache-empty">현재 메모리에 남아 있는 이미지 관련 항목이 없습니다.</div>
               )}
             </div>
           </>

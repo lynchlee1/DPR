@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 from photo_sorter import server
 
 
@@ -11,6 +12,41 @@ class DeferredThread:
 
     def start(self) -> None:
         pass
+
+
+def test_macos_folder_picker_uses_simple_single_selection_by_default(monkeypatch) -> None:
+    received: dict = {}
+
+    def fake_run(command, **kwargs):
+        received["command"] = command
+        return SimpleNamespace(returncode=0, stdout="/tmp/photos/\n")
+
+    monkeypatch.setattr(server.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    result = server.pick_folder()
+
+    assert "multiple selections allowed" not in received["command"][2]
+    assert result == {"path": "/tmp/photos", "paths": ["/tmp/photos"]}
+
+
+def test_macos_folder_picker_can_select_multiple_folders_at_once(monkeypatch) -> None:
+    received: dict = {}
+
+    def fake_run(command, **kwargs):
+        received["command"] = command
+        return SimpleNamespace(returncode=0, stdout="/tmp/camera/\n/tmp/phone/\n")
+
+    monkeypatch.setattr(server.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    result = server.pick_folder(multiple=True)
+
+    assert "multiple selections allowed" in received["command"][2]
+    assert result == {
+        "path": "/tmp/camera",
+        "paths": ["/tmp/camera", "/tmp/phone"],
+    }
 
 
 def test_quick_scan_respects_requested_threshold(tmp_path: Path, monkeypatch) -> None:
@@ -32,6 +68,21 @@ def test_scan_preserves_subfolder_choice(tmp_path: Path, monkeypatch) -> None:
     payload = server.create_scan(request)
 
     assert payload["include_subfolders"] is False
+    server.sessions.pop(payload["id"], None)
+
+
+def test_scan_preserves_multiple_selected_folders(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    first_folder = tmp_path / "camera"
+    second_folder = tmp_path / "phone"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    request = server.ScanRequest(folders=[str(first_folder), str(second_folder)])
+
+    payload = server.create_scan(request)
+
+    assert payload["folder"] == str(first_folder.resolve())
+    assert payload["folders"] == [str(first_folder.resolve()), str(second_folder.resolve())]
     server.sessions.pop(payload["id"], None)
 
 
@@ -203,11 +254,10 @@ def test_reset_calculations_rejects_running_scan() -> None:
     server.sessions.pop(session.id, None)
 
 
-def test_get_calculation_cache_lists_scanned_folders(monkeypatch) -> None:
+def test_get_calculation_cache_lists_memory_by_real_folder(monkeypatch) -> None:
     monkeypatch.setattr(server, "analysis_cache_groups", lambda: [
-        {"name": "photos", "path": "/tmp/photos", "entry_count": 2},
+        {"name": "photos", "path": "/tmp/photos", "entry_count": 2, "estimated_bytes": 200},
     ])
-    monkeypatch.setattr(server._render_image, "cache_info", lambda: SimpleNamespace(currsize=3))
     server.sessions["cached-scan"] = server.ScanSession(
         id="cached-scan",
         folder="/tmp/photos",
@@ -217,14 +267,62 @@ def test_get_calculation_cache_lists_scanned_folders(monkeypatch) -> None:
     )
 
     assert server.get_calculation_cache() == {
+        "total_bytes": 200,
         "analysis_entry_count": 2,
-        "analysis_groups": [
-            {"name": "photos", "path": "/tmp/photos", "entry_count": 2},
-        ],
-        "preview_entry_count": 3,
+        "preview_entry_count": 0,
+        "result_entry_count": 0,
         "session_count": 1,
+        "groups": [
+            {
+                "name": "photos",
+                "path": "/tmp/photos",
+                "total_bytes": 200,
+                "analysis_count": 2,
+                "analysis_bytes": 200,
+                "preview_count": 0,
+                "preview_bytes": 0,
+                "result_count": 0,
+                "result_bytes": 0,
+            },
+        ],
     }
     server.sessions.pop("cached-scan", None)
+
+
+def test_calculation_cache_includes_preview_and_completed_result_memory(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "actual-folder"
+    folder.mkdir()
+    photo = folder / "photo.jpg"
+    Image.new("RGB", (40, 30), (20, 40, 60)).save(photo)
+    session = server.ScanSession(
+        id="memory-scan",
+        folder=str(tmp_path),
+        threshold=88,
+        time_window_seconds=60,
+        status="complete",
+        result={"groups": [{"images": [{"id": "photo-1", "path": str(photo)}]}]},
+    )
+    server.sessions[session.id] = session
+    monkeypatch.setattr(server, "analysis_cache_groups", lambda: [])
+
+    response = server.get_image(session.id, "photo-1", "thumb")
+    payload = server.get_calculation_cache()
+
+    assert payload["preview_entry_count"] == 1
+    assert payload["result_entry_count"] == 1
+    assert len(payload["groups"]) == 1
+    group = payload["groups"][0]
+    assert group["path"] == str(folder)
+    assert group["preview_count"] == 1
+    assert group["preview_bytes"] == len(response.body)
+    assert group["result_count"] == 1
+    assert group["result_bytes"] > 0
+    assert group["total_bytes"] == group["preview_bytes"] + group["result_bytes"]
+
+    server.sessions.pop(session.id, None)
+    server._render_image.cache_clear()
+    with server._preview_cache_lock:
+        server._preview_cache_keys.clear()
 
 
 def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch) -> None:

@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 from typing import Callable, Iterable, Literal
@@ -35,7 +36,7 @@ ProgressCallback = Callable[[int, int, str], None]
 DateRangeCallback = Callable[[str | None, str | None], None]
 CancelCallback = Callable[[], bool]
 ANALYSIS_CACHE_MAX_SIZE = 10_000
-_analysis_cache_keys: OrderedDict[tuple, str] = OrderedDict()
+_analysis_cache_keys: OrderedDict[tuple, tuple[str, int]] = OrderedDict()
 _analysis_cache_lock = threading.Lock()
 
 
@@ -239,9 +240,17 @@ def analyze_image(
         time_source,
     )
     record = _analyze_image_cached(*cache_key)
+    estimated_bytes = (
+        sys.getsizeof(record)
+        + sys.getsizeof(record.path)
+        + sys.getsizeof(record.captured_at)
+        + sum(sys.getsizeof(value) for value in (record.phash, record.dhash, record.ahash, record.color_histogram))
+    )
     with _analysis_cache_lock:
         _analysis_cache_keys.pop(cache_key, None)
-        _analysis_cache_keys[cache_key] = str((cache_folder or resolved.parent).resolve())
+        # Cache ownership is reported by the file's real location, not by the
+        # root folder selected for a scan.
+        _analysis_cache_keys[cache_key] = (str(resolved.parent), estimated_bytes)
         while len(_analysis_cache_keys) > ANALYSIS_CACHE_MAX_SIZE:
             _analysis_cache_keys.popitem(last=False)
     return record
@@ -297,21 +306,23 @@ def clear_analysis_cache() -> int:
 
 
 def analysis_cache_groups() -> list[dict]:
-    """Return cached analysis entries grouped by the scanned root folder."""
+    """Return cached analysis memory grouped by each file's real parent folder."""
     with _analysis_cache_lock:
-        cache_folders = list(_analysis_cache_keys.values())
+        entries = list(_analysis_cache_keys.values())
 
-    counts_by_folder: dict[str, int] = {}
-    for folder_text in cache_folders:
-        counts_by_folder[folder_text] = counts_by_folder.get(folder_text, 0) + 1
+    usage_by_folder: dict[str, dict[str, int]] = {}
+    for folder_text, estimated_bytes in entries:
+        usage = usage_by_folder.setdefault(folder_text, {"entry_count": 0, "estimated_bytes": 0})
+        usage["entry_count"] += 1
+        usage["estimated_bytes"] += estimated_bytes
     return [
         {
             "name": Path(folder_text).name or folder_text,
             "path": folder_text,
-            "entry_count": entry_count,
+            **usage,
         }
-        for folder_text, entry_count in sorted(
-            counts_by_folder.items(),
+        for folder_text, usage in sorted(
+            usage_by_folder.items(),
             key=lambda item: item[0].casefold(),
         )
     ]
@@ -364,7 +375,7 @@ def _matching_components(
 
 
 def scan_folder(
-    folder: Path,
+    folder: Path | list[Path],
     threshold: float = 88.0,
     time_window_seconds: int = 60,
     on_progress: ProgressCallback | None = None,
@@ -378,9 +389,22 @@ def scan_folder(
     should_cancel: CancelCallback | None = None,
 ) -> dict:
     started = time.perf_counter()
-    folder = folder.expanduser().resolve()
-    if not folder.is_dir():
-        raise NotADirectoryError(f"폴더를 찾을 수 없습니다: {folder}")
+    folders = folder if isinstance(folder, list) else [folder]
+    folders = [item.expanduser().resolve() for item in folders]
+    if not folders:
+        raise NotADirectoryError("분석할 폴더를 선택해 주세요.")
+    for source_folder in folders:
+        if not source_folder.is_dir():
+            raise NotADirectoryError(f"폴더를 찾을 수 없습니다: {source_folder}")
+    folder = folders[0]
+
+    def source_root(path: Path) -> Path:
+        return next(root for root in folders if path == root or root in path.parents)
+
+    def relative_path(path: Path) -> str:
+        root = source_root(path)
+        relative = path.resolve().relative_to(root).as_posix()
+        return relative if len(folders) == 1 else f"{root.name}/{relative}"
     if not 0 <= threshold <= 100:
         raise ValueError("유사도 기준은 0에서 100 사이여야 합니다.")
     if time_window_seconds < 1:
@@ -396,15 +420,25 @@ def scan_folder(
     json_files_deleted = 0
     failures: list[dict[str, str]] = []
     if cleanup_json_files:
-        _raise_if_cancelled(should_cancel)
-        json_files_deleted, json_failures = delete_json_files(
-            folder,
-            include_subfolders=include_subfolders,
-        )
-        failures.extend(json_failures)
+        for source_folder in folders:
+            _raise_if_cancelled(should_cancel)
+            deleted, json_failures = delete_json_files(
+                source_folder,
+                include_subfolders=include_subfolders,
+            )
+            json_files_deleted += deleted
+            failures.extend(json_failures)
 
-    image_paths = discover_images(folder, include_subfolders=include_subfolders)
-    video_paths = discover_videos(folder, include_subfolders=include_subfolders)
+    image_paths = list({
+        path
+        for source_folder in folders
+        for path in discover_images(source_folder, include_subfolders=include_subfolders)
+    })
+    video_paths = list({
+        path
+        for source_folder in folders
+        for path in discover_videos(source_folder, include_subfolders=include_subfolders)
+    })
     paths = sorted(image_paths + video_paths, key=lambda path: str(path).casefold())
     records: list[ImageRecord] = []
     progress_lock = threading.Lock()
@@ -474,7 +508,7 @@ def scan_folder(
     cancelled = False
     try:
         futures = {
-            pool.submit(analyze_image, path, capture_info_by_path.get(path), folder): path
+            pool.submit(analyze_image, path, capture_info_by_path.get(path), source_root(path)): path
             for path in selected_image_paths
         }
         for future in as_completed(futures):
@@ -578,12 +612,13 @@ def scan_folder(
             serialized_images.append(
                 _serialize_record(
                     member,
-                    folder,
+                    source_root(member.path),
                     score_to_keeper,
                     member.id != reference_id
                     and (keeper_strategy == "latest" or score_to_keeper >= threshold),
                     similarity_matrix[member.id],
                     reference_id,
+                    relative_path(member.path),
                 )
             )
         groups.append(
@@ -615,7 +650,7 @@ def scan_folder(
             "id": identity,
             "name": path.name,
             "path": str(path.resolve()),
-            "relative_path": path.resolve().relative_to(folder).as_posix(),
+            "relative_path": relative_path(path),
             "captured_at": captured_at.isoformat(),
             "time_source": time_source,
             "media_type": "video",
@@ -648,6 +683,7 @@ def scan_folder(
     duration = time.perf_counter() - started
     return {
         "folder": str(folder),
+        "folders": [str(source_folder) for source_folder in folders],
         "threshold": threshold,
         "time_window_seconds": time_window_seconds,
         "keeper_strategy": keeper_strategy,
@@ -695,12 +731,13 @@ def _serialize_record(
     marked: bool,
     similarity_by_id: dict[str, float],
     reference_id: str,
+    relative_path: str | None = None,
 ) -> dict:
     return {
         "id": record.id,
         "name": record.path.name,
         "path": str(record.path),
-        "relative_path": record.path.relative_to(root).as_posix(),
+        "relative_path": relative_path or record.path.relative_to(root).as_posix(),
         "captured_at": record.captured_at.isoformat(),
         "time_source": record.time_source,
         "media_type": "image",
