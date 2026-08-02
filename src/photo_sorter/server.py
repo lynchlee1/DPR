@@ -27,7 +27,7 @@ from .core import (
     SUPPORTED_EXTENSIONS,
     SUPPORTED_VIDEO_EXTENSIONS,
     ScanCancelled,
-    analysis_cache_entries,
+    analysis_cache_groups,
     clear_analysis_cache,
     scan_folder,
 )
@@ -110,7 +110,7 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.0.2")
+app = FastAPI(title="사진 정리", version="1.0.3")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
@@ -276,12 +276,12 @@ def reset_calculations() -> dict:
 
 @app.get("/api/calculations/cache")
 def get_calculation_cache() -> dict:
-    entries = analysis_cache_entries()
+    groups = analysis_cache_groups()
     with sessions_lock:
         session_count = len(sessions)
     return {
-        "analysis_entry_count": sum(entry["entry_count"] for entry in entries),
-        "analysis_files": entries,
+        "analysis_entry_count": sum(group["entry_count"] for group in groups),
+        "analysis_groups": groups,
         "preview_entry_count": _render_image.cache_info().currsize,
         "session_count": session_count,
     }

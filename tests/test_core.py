@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from photo_sorter import core
-from photo_sorter.core import analysis_cache_entries, analyze_image, capture_time, discover_images, discover_videos, scan_folder, similarity
+from photo_sorter.core import analysis_cache_groups, analyze_image, capture_time, discover_images, discover_videos, scan_folder, similarity
 
 
 def save_image(path: Path, color: tuple[int, int, int], exif_time: str | None = None) -> None:
@@ -299,9 +299,9 @@ def test_date_limit_fully_analyzes_only_images_from_selected_capture_days(
     analyzed: list[str] = []
     original_analyze_image = core.analyze_image
 
-    def recording_analyze_image(path: Path, capture_info=None):
+    def recording_analyze_image(path: Path, capture_info=None, cache_folder=None):
         analyzed.append(path.name)
-        return original_analyze_image(path, capture_info)
+        return original_analyze_image(path, capture_info, cache_folder)
 
     monkeypatch.setattr(core, "analyze_image", recording_analyze_image)
 
@@ -332,7 +332,7 @@ def test_clear_analysis_cache_discards_cached_records(tmp_path: Path) -> None:
     assert second is not first
 
 
-def test_analysis_cache_entries_are_represented_by_filename(tmp_path: Path) -> None:
+def test_analysis_cache_entries_are_grouped_by_scanned_folder(tmp_path: Path) -> None:
     first_path = tmp_path / "first-photo.jpg"
     second_path = tmp_path / "nested" / "second-photo.jpg"
     second_path.parent.mkdir()
@@ -340,17 +340,22 @@ def test_analysis_cache_entries_are_represented_by_filename(tmp_path: Path) -> N
     save_image(second_path, (170, 48, 35))
 
     core.clear_analysis_cache()
-    analyze_image(second_path)
-    analyze_image(first_path)
-    analyze_image(first_path)
+    analyze_image(second_path, cache_folder=tmp_path)
+    analyze_image(first_path, cache_folder=tmp_path)
+    analyze_image(first_path, cache_folder=tmp_path)
 
-    assert analysis_cache_entries() == [
-        {"name": "first-photo.jpg", "path": str(first_path), "entry_count": 1},
-        {"name": "second-photo.jpg", "path": str(second_path), "entry_count": 1},
+    assert analysis_cache_groups() == [
+        {"name": tmp_path.name, "path": str(tmp_path), "entry_count": 2},
+    ]
+
+    analyze_image(second_path, cache_folder=second_path.parent)
+    assert analysis_cache_groups() == [
+        {"name": tmp_path.name, "path": str(tmp_path), "entry_count": 1},
+        {"name": "nested", "path": str(second_path.parent), "entry_count": 1},
     ]
 
     core.clear_analysis_cache()
-    assert analysis_cache_entries() == []
+    assert analysis_cache_groups() == []
 
 
 def test_one_minute_chain_forms_one_five_photo_group(tmp_path: Path) -> None:

@@ -35,7 +35,7 @@ ProgressCallback = Callable[[int, int, str], None]
 DateRangeCallback = Callable[[str | None, str | None], None]
 CancelCallback = Callable[[], bool]
 ANALYSIS_CACHE_MAX_SIZE = 10_000
-_analysis_cache_keys: OrderedDict[tuple, None] = OrderedDict()
+_analysis_cache_keys: OrderedDict[tuple, str] = OrderedDict()
 _analysis_cache_lock = threading.Lock()
 
 
@@ -226,6 +226,7 @@ def _fingerprints(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarra
 def analyze_image(
     path: Path,
     capture_info: tuple[datetime, str] | None = None,
+    cache_folder: Path | None = None,
 ) -> ImageRecord:
     resolved = path.resolve()
     stat = resolved.stat()
@@ -240,7 +241,7 @@ def analyze_image(
     record = _analyze_image_cached(*cache_key)
     with _analysis_cache_lock:
         _analysis_cache_keys.pop(cache_key, None)
-        _analysis_cache_keys[cache_key] = None
+        _analysis_cache_keys[cache_key] = str((cache_folder or resolved.parent).resolve())
         while len(_analysis_cache_keys) > ANALYSIS_CACHE_MAX_SIZE:
             _analysis_cache_keys.popitem(last=False)
     return record
@@ -295,22 +296,22 @@ def clear_analysis_cache() -> int:
     return entry_count
 
 
-def analysis_cache_entries() -> list[dict]:
-    """Return cached analysis entries grouped by source file for display."""
+def analysis_cache_groups() -> list[dict]:
+    """Return cached analysis entries grouped by the scanned root folder."""
     with _analysis_cache_lock:
-        path_texts = [key[0] for key in _analysis_cache_keys]
+        cache_folders = list(_analysis_cache_keys.values())
 
-    counts_by_path: dict[str, int] = {}
-    for path_text in path_texts:
-        counts_by_path[path_text] = counts_by_path.get(path_text, 0) + 1
+    counts_by_folder: dict[str, int] = {}
+    for folder_text in cache_folders:
+        counts_by_folder[folder_text] = counts_by_folder.get(folder_text, 0) + 1
     return [
         {
-            "name": Path(path_text).name,
-            "path": path_text,
+            "name": Path(folder_text).name or folder_text,
+            "path": folder_text,
             "entry_count": entry_count,
         }
-        for path_text, entry_count in sorted(
-            counts_by_path.items(),
+        for folder_text, entry_count in sorted(
+            counts_by_folder.items(),
             key=lambda item: item[0].casefold(),
         )
     ]
@@ -473,7 +474,7 @@ def scan_folder(
     cancelled = False
     try:
         futures = {
-            pool.submit(analyze_image, path, capture_info_by_path.get(path)): path
+            pool.submit(analyze_image, path, capture_info_by_path.get(path), folder): path
             for path in selected_image_paths
         }
         for future in as_completed(futures):

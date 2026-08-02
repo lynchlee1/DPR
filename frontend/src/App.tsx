@@ -136,7 +136,7 @@ type StorageOutcome = {
 
 type CalculationCache = {
   analysis_entry_count: number;
-  analysis_files: { name: string; path: string; entry_count: number }[];
+  analysis_groups: { name: string; path: string; entry_count: number }[];
   preview_entry_count: number;
   session_count: number;
 };
@@ -1927,18 +1927,18 @@ function CacheDialog({
         ) : (
           <>
             <p>
-              분석값 {cache.analysis_entry_count.toLocaleString()}개를 파일명으로 표시합니다.
+              분석값 {cache.analysis_entry_count.toLocaleString()}개를 검사한 폴더 {cache.analysis_groups.length.toLocaleString()}개 묶음으로 표시합니다.
               미리보기 {cache.preview_entry_count.toLocaleString()}개와 분석 결과 {cache.session_count.toLocaleString()}건도 메모리에 있습니다.
             </p>
-            <div className="cache-file-list" role="list" aria-label="캐시된 이미지 계산 파일">
-              {cache.analysis_files.length ? cache.analysis_files.map((file) => (
-                <div className="cache-file-row" role="listitem" key={file.path} title={file.path}>
-                  <ImageSquare size={17} />
-                  <span><strong>{file.name}</strong><small>{file.path}</small></span>
-                  {file.entry_count > 1 && <em>{file.entry_count}</em>}
+            <div className="cache-group-list" role="list" aria-label="검사 폴더별 이미지 계산 캐시">
+              {cache.analysis_groups.length ? cache.analysis_groups.map((group) => (
+                <div className="cache-group-row" role="listitem" key={group.path} title={group.path}>
+                  <FolderOpen size={17} />
+                  <span><strong>{group.name}</strong><small>{group.path}</small></span>
+                  <em>{group.entry_count.toLocaleString()}개</em>
                 </div>
               )) : (
-                <div className="cache-empty">저장된 이미지 계산값이 없습니다.</div>
+                <div className="cache-empty">검사 폴더의 이미지 계산값이 없습니다.</div>
               )}
             </div>
           </>

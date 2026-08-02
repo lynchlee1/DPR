@@ -203,9 +203,9 @@ def test_reset_calculations_rejects_running_scan() -> None:
     server.sessions.pop(session.id, None)
 
 
-def test_get_calculation_cache_lists_analysis_files(monkeypatch) -> None:
-    monkeypatch.setattr(server, "analysis_cache_entries", lambda: [
-        {"name": "photo.jpg", "path": "/tmp/photos/photo.jpg", "entry_count": 2},
+def test_get_calculation_cache_lists_scanned_folders(monkeypatch) -> None:
+    monkeypatch.setattr(server, "analysis_cache_groups", lambda: [
+        {"name": "photos", "path": "/tmp/photos", "entry_count": 2},
     ])
     monkeypatch.setattr(server._render_image, "cache_info", lambda: SimpleNamespace(currsize=3))
     server.sessions["cached-scan"] = server.ScanSession(
@@ -218,8 +218,8 @@ def test_get_calculation_cache_lists_analysis_files(monkeypatch) -> None:
 
     assert server.get_calculation_cache() == {
         "analysis_entry_count": 2,
-        "analysis_files": [
-            {"name": "photo.jpg", "path": "/tmp/photos/photo.jpg", "entry_count": 2},
+        "analysis_groups": [
+            {"name": "photos", "path": "/tmp/photos", "entry_count": 2},
         ],
         "preview_entry_count": 3,
         "session_count": 1,
