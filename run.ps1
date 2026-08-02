@@ -7,7 +7,7 @@ Set-Location $ProjectDir
 try {
     $Health = Invoke-RestMethod -Uri "$AppUrl/api/health" -TimeoutSec 2
     if ($Health.ok) {
-        Write-Host "사진 정리가 이미 실행 중입니다. 기존 화면을 엽니다."
+        Write-Host "PhotoSorter is already running. Opening the existing window."
         Start-Process $AppUrl
         exit 0
     }

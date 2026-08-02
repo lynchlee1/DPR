@@ -17,18 +17,18 @@ switch ($Architecture) {
         $NodePlatform = "win-arm64"
         $NodeExpectedHash = "fec025a6da31757e3b6af84c5a1628e9d38442ca99a2161091d78f2fcfa35ef3"
     }
-    default { throw "지원하지 않는 Windows CPU입니다: $Architecture" }
+    default { throw "Unsupported Windows CPU: $Architecture" }
 }
 
 $UvExe = Join-Path $ToolsDir "uv\uv.exe"
 if (-not (Test-Path $UvExe)) {
-    Write-Host "내장 Python 관리 도구를 내려받는 중입니다..."
+    Write-Host "Downloading the bundled Python manager..."
     $UvArchive = "uv-$UvPlatform.zip"
     $UvDownload = Join-Path $ToolsDir $UvArchive
     Invoke-WebRequest "https://github.com/astral-sh/uv/releases/download/$UvVersion/$UvArchive" -OutFile $UvDownload
     $ActualHash = (Get-FileHash -Algorithm SHA256 $UvDownload).Hash
     if ($ActualHash -ne $UvExpectedHash) {
-        throw "uv 다운로드 파일의 SHA-256 검증에 실패했습니다."
+        throw "The uv download failed SHA-256 verification."
     }
     New-Item -ItemType Directory -Force -Path (Split-Path $UvExe) | Out-Null
     Expand-Archive -Path $UvDownload -DestinationPath (Split-Path $UvExe) -Force
@@ -40,12 +40,12 @@ $NodeArchive = "node-v$NodeVersion-$NodePlatform.zip"
 $NodeHome = Join-Path $ToolsDir "node-v$NodeVersion-$NodePlatform"
 $NodeExe = Join-Path $NodeHome "node.exe"
 if (-not (Test-Path $NodeExe)) {
-    Write-Host "내장 프런트엔드 빌드 도구를 내려받는 중입니다..."
+    Write-Host "Downloading the bundled frontend build tools..."
     $NodeDownload = Join-Path $ToolsDir $NodeArchive
     Invoke-WebRequest "https://nodejs.org/dist/v$NodeVersion/$NodeArchive" -OutFile $NodeDownload
     $ActualHash = (Get-FileHash -Algorithm SHA256 $NodeDownload).Hash
     if ($ActualHash -ne $NodeExpectedHash) {
-        throw "Node.js 다운로드 파일의 SHA-256 검증에 실패했습니다."
+        throw "The Node.js download failed SHA-256 verification."
     }
     Expand-Archive -Path $NodeDownload -DestinationPath $ToolsDir -Force
 }

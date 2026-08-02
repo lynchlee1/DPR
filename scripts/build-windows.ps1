@@ -31,4 +31,4 @@ if (Test-Path $ArchivePath) {
 }
 Compress-Archive -Path "dist\PhotoSorter" -DestinationPath $ArchivePath
 
-Write-Host "빌드 완료: $ArchivePath"
+Write-Host "Build complete: $ArchivePath"
