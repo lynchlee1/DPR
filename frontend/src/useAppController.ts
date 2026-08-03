@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { GuideState } from "./GuideOverlay";
 import type {
   AnalysisMode,
+  CacheDeleteOutcome,
   CalculationCache,
   CleanupOutcome,
   DateOrder,
@@ -73,6 +74,7 @@ export function useAppController() {
   const [resetNotice, setResetNotice] = useState<string | null>(null);
   const [isCacheDialogOpen, setIsCacheDialogOpen] = useState(false);
   const [isCacheLoading, setIsCacheLoading] = useState(false);
+  const [deletingCacheFolder, setDeletingCacheFolder] = useState<string | null>(null);
   const [calculationCache, setCalculationCache] = useState<CalculationCache | null>(null);
   const [isTrashDialogOpen, setIsTrashDialogOpen] = useState(false);
   const [trashThroughGroupIndex, setTrashThroughGroupIndex] = useState<number | null>(null);
@@ -339,6 +341,40 @@ export function useAppController() {
       setError(cacheError instanceof Error ? cacheError.message : "캐시 목록을 불러오지 못했습니다.");
     } finally {
       setIsCacheLoading(false);
+    }
+  }
+
+  async function deleteCacheFolder(folderPath: string) {
+    const confirmed = window.confirm(
+      `${folderPath}\n\n이 폴더의 분석값, 미리보기와 완료된 분석 결과를 메모리에서 삭제할까요? 원본 파일은 삭제되지 않습니다.`,
+    );
+    if (!confirmed) return;
+
+    setDeletingCacheFolder(folderPath);
+    setError(null);
+    setResetNotice(null);
+    try {
+      const outcome = await api<CacheDeleteOutcome>("/api/calculations/cache", {
+        method: "DELETE",
+        body: JSON.stringify({ folder: folderPath }),
+      });
+      if (session && outcome.removed_session_ids.includes(session.id)) {
+        setSession(null);
+        setResult(null);
+        setSelectedGroupIndex(0);
+        setSelectedPhotoId(null);
+        setCleanupOutcome(null);
+        setStorageOutcome(null);
+      }
+      setCalculationCache(await api<CalculationCache>("/api/calculations/cache"));
+      const removedCount = outcome.removed_analysis_entries
+        + outcome.removed_preview_entries
+        + outcome.removed_result_entries;
+      setResetNotice(`${folderPath}의 메모리 항목 ${removedCount.toLocaleString()}개를 삭제했습니다.`);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "개별 캐시를 삭제하지 못했습니다.");
+    } finally {
+      setDeletingCacheFolder(null);
     }
   }
 
@@ -634,7 +670,7 @@ export function useAppController() {
     includeSubfolders, cleanupJsonFiles, dayLimit, dateOrder, showSingletons,
     arrowRepeatInterval, isAdvancedOpen, session, result, selectedGroupIndex,
     selectedPhotoId, isFolderBrowserOpen, isPickingDestination, isResetting,
-    resetNotice, isCacheDialogOpen, isCacheLoading, calculationCache,
+    resetNotice, isCacheDialogOpen, isCacheLoading, deletingCacheFolder, calculationCache,
     isTrashDialogOpen, trashThroughGroupIndex, isTrashing, cleanupOutcome,
     isStorageDialogOpen, isStoring, isCancelling, storageOutcome, error, guide,
     helpButtonRef, isScanning, isMoving, selectedFolders, activeStatus,
@@ -650,7 +686,7 @@ export function useAppController() {
     setIsCacheDialogOpen, setIsTrashDialogOpen, setTrashThroughGroupIndex,
     setCleanupOutcome, setIsStorageDialogOpen, setStorageOutcome, setError,
     setGuide, updateManualFolder, removeFolder, clearFolders, applyFolders,
-    pickDestination, openCacheDialog, resetCalculations, startScan,
+    pickDestination, openCacheDialog, deleteCacheFolder, resetCalculations, startScan,
     stopActiveOperation, selectGroup, toggleMarked, applySwipeDecision,
     markCurrentGroup, updateSingletonVisibility, openTrashDialog,
     openStorageDialog, closeGuide, changeGuide, storeKeptPhotos, trashMarked,

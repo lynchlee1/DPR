@@ -256,13 +256,13 @@ def test_reset_calculations_clears_sessions_and_caches(monkeypatch) -> None:
     server.sessions[session.id] = session
     preview_cache_cleared = False
 
-    def clear_preview_cache() -> None:
+    def clear_preview_cache() -> int:
         nonlocal preview_cache_cleared
         preview_cache_cleared = True
+        return 3
 
     monkeypatch.setattr(server, "clear_analysis_cache", lambda: 7)
-    monkeypatch.setattr(server._render_image, "cache_info", lambda: SimpleNamespace(currsize=3))
-    monkeypatch.setattr(server._render_image, "cache_clear", clear_preview_cache)
+    monkeypatch.setattr(server, "_clear_preview_cache", clear_preview_cache)
     monkeypatch.setattr(server.gc, "collect", lambda: 0)
 
     result = server.reset_calculations()
@@ -359,9 +359,44 @@ def test_calculation_cache_includes_preview_and_completed_result_memory(tmp_path
     assert group["total_bytes"] == group["preview_bytes"] + group["result_bytes"]
 
     server.sessions.pop(session.id, None)
-    server._render_image.cache_clear()
+    server._clear_preview_cache()
+
+
+def test_delete_calculation_cache_removes_only_selected_folder(tmp_path: Path) -> None:
+    first_folder = tmp_path / "first"
+    second_folder = tmp_path / "second"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    first_photo = first_folder / "photo.jpg"
+    second_photo = second_folder / "photo.jpg"
+    Image.new("RGB", (40, 30), (20, 40, 60)).save(first_photo)
+    Image.new("RGB", (40, 30), (60, 40, 20)).save(second_photo)
+    server._clear_preview_cache()
+    server._render_image(str(first_photo), first_photo.stat().st_mtime_ns, 320)
+    server._render_image(str(second_photo), second_photo.stat().st_mtime_ns, 320)
+
+    for session_id, photo in (("first-scan", first_photo), ("second-scan", second_photo)):
+        server.sessions[session_id] = server.ScanSession(
+            id=session_id,
+            folder=str(photo.parent),
+            threshold=88,
+            time_window_seconds=60,
+            status="complete",
+            result={"groups": [{"images": [{"id": session_id, "path": str(photo)}]}]},
+        )
+
+    outcome = server.delete_calculation_cache(server.CacheDeleteRequest(folder=str(first_folder)))
+
+    assert outcome["removed_preview_entries"] == 1
+    assert outcome["removed_result_entries"] == 1
+    assert outcome["removed_session_ids"] == ["first-scan"]
+    assert "first-scan" not in server.sessions
+    assert "second-scan" in server.sessions
     with server._preview_cache_lock:
-        server._preview_cache_keys.clear()
+        assert [folder for _, folder in server._preview_cache.values()] == [str(second_folder)]
+
+    server.sessions.pop("second-scan", None)
+    server._clear_preview_cache()
 
 
 def test_store_kept_passes_selection_and_destination(tmp_path: Path, monkeypatch) -> None:

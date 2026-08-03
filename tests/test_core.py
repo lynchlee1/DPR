@@ -166,14 +166,16 @@ def test_scan_recurses_through_nested_photo_folders(tmp_path: Path) -> None:
 def test_scan_analyzes_heic_and_heic_content_with_jpg_extension(tmp_path: Path) -> None:
     heic_path = tmp_path / "20240101_120000_photo.heic"
     disguised_path = tmp_path / "20240101_120030_photo.jpg"
+    avif_path = tmp_path / "20240101_120100_photo.avif"
     save_heic(heic_path)
     save_heic(disguised_path)
+    save_image(avif_path, (26, 93, 142))
 
     result = scan_folder(tmp_path, threshold=88, time_window_seconds=60, max_workers=2)
 
-    assert discover_images(tmp_path) == [heic_path, disguised_path]
-    assert result["stats"]["found"] == 2
-    assert result["stats"]["analyzed"] == 2
+    assert discover_images(tmp_path) == [heic_path, disguised_path, avif_path]
+    assert result["stats"]["found"] == 3
+    assert result["stats"]["analyzed"] == 3
     assert result["failures"] == []
 
 
@@ -402,6 +404,29 @@ def test_analysis_cache_entries_are_grouped_by_real_parent_folder(tmp_path: Path
 
     core.clear_analysis_cache()
     assert analysis_cache_groups() == []
+
+
+def test_clear_analysis_cache_folder_keeps_other_folder_entries(tmp_path: Path) -> None:
+    first_folder = tmp_path / "first"
+    second_folder = tmp_path / "second"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    first_path = first_folder / "photo.jpg"
+    second_path = second_folder / "photo.jpg"
+    save_image(first_path, (26, 93, 142))
+    save_image(second_path, (170, 48, 35))
+
+    core.clear_analysis_cache()
+    first_record = analyze_image(first_path)
+    second_record = analyze_image(second_path)
+
+    removed_count, removed_bytes = core.clear_analysis_cache_folder(first_folder)
+
+    assert removed_count == 1
+    assert removed_bytes > 0
+    assert analyze_image(first_path) is not first_record
+    assert analyze_image(second_path) is second_record
+    core.clear_analysis_cache()
 
 
 def test_one_minute_chain_forms_one_five_photo_group(tmp_path: Path) -> None:

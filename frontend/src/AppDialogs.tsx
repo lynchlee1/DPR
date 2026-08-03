@@ -173,21 +173,26 @@ export function CacheDialog({
   cache,
   loading,
   resetting,
+  deletingFolder,
   canReset,
   onCancel,
+  onDelete,
   onReset,
 }: {
   cache: CalculationCache | null;
   loading: boolean;
   resetting: boolean;
+  deletingFolder: string | null;
   canReset: boolean;
   onCancel: () => void;
+  onDelete: (folder: string) => void;
   onReset: () => void;
 }) {
+  const busy = resetting || deletingFolder !== null;
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !resetting) onCancel(); }}>
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
       <div className="modal cache-modal" role="dialog" aria-modal="true" aria-labelledby="cache-title">
-        <button className="modal-close" aria-label="닫기" onClick={onCancel} disabled={resetting}><X size={18} /></button>
+        <button className="modal-close" aria-label="닫기" onClick={onCancel} disabled={busy}><X size={18} /></button>
         <div className="modal-icon cache"><Database size={24} weight="duotone" /></div>
         <h2 id="cache-title">이미지 계산 캐시</h2>
         {loading || !cache ? (
@@ -214,7 +219,18 @@ export function CacheDialog({
                       분석 {group.analysis_count.toLocaleString()} · 미리보기 {group.preview_count.toLocaleString()} · 결과 {group.result_count.toLocaleString()}
                     </small>
                   </span>
-                  <em>{formatBytes(group.total_bytes)}</em>
+                  <div className="cache-group-actions">
+                    <em>{formatBytes(group.total_bytes)}</em>
+                    <button
+                      type="button"
+                      aria-label={`${group.name} 캐시 삭제`}
+                      title="이 폴더의 캐시만 삭제"
+                      onClick={() => onDelete(group.path)}
+                      disabled={!canReset || busy}
+                    >
+                      {deletingFolder === group.path ? <CircleNotch size={15} className="spin" /> : <Trash size={15} />}
+                    </button>
+                  </div>
                 </div>
               )) : (
                 <div className="cache-empty">현재 메모리에 남아 있는 이미지 관련 항목이 없습니다.</div>
@@ -223,8 +239,8 @@ export function CacheDialog({
           </>
         )}
         <div className="modal-actions">
-          <button className="button button-secondary" onClick={onCancel} disabled={resetting}>닫기</button>
-          <button className="button button-danger-soft" onClick={onReset} disabled={loading || resetting || !canReset}>
+          <button className="button button-secondary" onClick={onCancel} disabled={busy}>닫기</button>
+          <button className="button button-danger-soft" onClick={onReset} disabled={loading || busy || !canReset}>
             <ArrowCounterClockwise size={16} />{resetting ? "초기화 중" : "전체 캐시 초기화"}
           </button>
         </div>

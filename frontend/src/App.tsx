@@ -38,7 +38,7 @@ export function App() {
     dayLimit, dateOrder, showSingletons, arrowRepeatInterval, isAdvancedOpen,
     session, result, selectedGroupIndex, isFolderBrowserOpen,
     isPickingDestination, isResetting, resetNotice, isCacheDialogOpen,
-    isCacheLoading, calculationCache, isTrashDialogOpen,
+    isCacheLoading, deletingCacheFolder, calculationCache, isTrashDialogOpen,
     trashThroughGroupIndex, isTrashing, cleanupOutcome, isStorageDialogOpen,
     isStoring, isCancelling, storageOutcome, error, guide, helpButtonRef,
     isScanning, isMoving, selectedFolders, activeStatus, visibleGroups,
@@ -53,7 +53,7 @@ export function App() {
     setIsCacheDialogOpen, setIsTrashDialogOpen, setTrashThroughGroupIndex,
     setCleanupOutcome, setIsStorageDialogOpen, setStorageOutcome, setError,
     setGuide, updateManualFolder, removeFolder, clearFolders, applyFolders,
-    pickDestination, openCacheDialog, resetCalculations, startScan,
+    pickDestination, openCacheDialog, deleteCacheFolder, resetCalculations, startScan,
     stopActiveOperation, selectGroup, toggleMarked, applySwipeDecision,
     markCurrentGroup, updateSingletonVisibility, openTrashDialog,
     openStorageDialog, closeGuide, changeGuide, storeKeptPhotos, trashMarked,
@@ -627,8 +627,10 @@ export function App() {
           cache={calculationCache}
           loading={isCacheLoading}
           resetting={isResetting}
+          deletingFolder={deletingCacheFolder}
           canReset={!isScanning && !isMoving}
           onCancel={() => setIsCacheDialogOpen(false)}
+          onDelete={deleteCacheFolder}
           onReset={async () => {
             if (await resetCalculations()) setIsCacheDialogOpen(false);
           }}

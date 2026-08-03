@@ -50,8 +50,8 @@ ProgressCallback = Callable[[int, int, str], None]
 DateRangeCallback = Callable[[str | None, str | None], None]
 CancelCallback = Callable[[], bool]
 ANALYSIS_CACHE_MAX_SIZE = 10_000
-_analysis_cache_keys: OrderedDict[tuple, tuple[str, int]] = OrderedDict()
-_analysis_cache_lock = threading.Lock()
+_analysis_cache: OrderedDict[tuple, tuple[ImageRecord, str, int]] = OrderedDict()
+_analysis_cache_lock = threading.RLock()
 
 
 class ScanCancelled(Exception):
@@ -257,7 +257,13 @@ def analyze_image(
         captured_at,
         time_source,
     )
-    record = _analyze_image_cached(*cache_key)
+    with _analysis_cache_lock:
+        cached = _analysis_cache.pop(cache_key, None)
+        if cached is not None:
+            _analysis_cache[cache_key] = cached
+            return cached[0]
+
+    record = _compute_image_record(*cache_key)
     estimated_bytes = (
         sys.getsizeof(record)
         + sys.getsizeof(record.path)
@@ -265,17 +271,14 @@ def analyze_image(
         + sum(sys.getsizeof(value) for value in (record.phash, record.dhash, record.ahash, record.color_histogram))
     )
     with _analysis_cache_lock:
-        _analysis_cache_keys.pop(cache_key, None)
-        # Cache ownership is reported by the file's real location, not by the
-        # root folder selected for a scan.
-        _analysis_cache_keys[cache_key] = (str(resolved.parent), estimated_bytes)
-        while len(_analysis_cache_keys) > ANALYSIS_CACHE_MAX_SIZE:
-            _analysis_cache_keys.popitem(last=False)
+        _analysis_cache.pop(cache_key, None)
+        _analysis_cache[cache_key] = (record, str(resolved.parent), estimated_bytes)
+        while len(_analysis_cache) > ANALYSIS_CACHE_MAX_SIZE:
+            _analysis_cache.popitem(last=False)
     return record
 
 
-@lru_cache(maxsize=ANALYSIS_CACHE_MAX_SIZE)
-def _analyze_image_cached(
+def _compute_image_record(
     path_text: str,
     modified_ns: int,
     size_bytes: int,
@@ -316,17 +319,29 @@ def _analyze_image_cached(
 
 
 def clear_analysis_cache() -> int:
-    entry_count = _analyze_image_cached.cache_info().currsize
-    _analyze_image_cached.cache_clear()
     with _analysis_cache_lock:
-        _analysis_cache_keys.clear()
-    return entry_count
+        entry_count = len(_analysis_cache)
+        _analysis_cache.clear()
+        return entry_count
+
+
+def clear_analysis_cache_folder(folder: Path) -> tuple[int, int]:
+    target = str(folder.expanduser().resolve())
+    with _analysis_cache_lock:
+        matching_keys = [
+            key for key, (_, folder_text, _) in _analysis_cache.items()
+            if folder_text == target
+        ]
+        removed_bytes = sum(_analysis_cache[key][2] for key in matching_keys)
+        for key in matching_keys:
+            del _analysis_cache[key]
+    return len(matching_keys), removed_bytes
 
 
 def analysis_cache_groups() -> list[dict]:
     """Return cached analysis memory grouped by each file's real parent folder."""
     with _analysis_cache_lock:
-        entries = list(_analysis_cache_keys.values())
+        entries = [(folder_text, estimated_bytes) for _, folder_text, estimated_bytes in _analysis_cache.values()]
 
     usage_by_folder: dict[str, dict[str, int]] = {}
     for folder_text, estimated_bytes in entries:

@@ -140,6 +140,16 @@ export type CalculationCache = {
   }[];
 };
 
+export type CacheDeleteOutcome = {
+  folder: string;
+  removed_analysis_entries: number;
+  removed_analysis_bytes: number;
+  removed_preview_entries: number;
+  removed_preview_bytes: number;
+  removed_result_entries: number;
+  removed_session_ids: string[];
+};
+
 export type FolderBrowserData = {
   path: string;
   parent: string | null;

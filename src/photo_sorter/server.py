@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from functools import lru_cache
 import gc
 import io
 import platform
@@ -30,6 +29,7 @@ from .core import (
     ScanCancelled,
     analysis_cache_groups,
     clear_analysis_cache,
+    clear_analysis_cache_folder,
     scan_folder,
 )
 from .storage import inspect_source_directories, move_selection_to_storage
@@ -64,6 +64,10 @@ class TrashRequest(BaseModel):
 class StoreRequest(BaseModel):
     image_ids: list[str]
     destination: str = Field(min_length=1)
+
+
+class CacheDeleteRequest(BaseModel):
+    folder: str = Field(min_length=1)
 
 
 @dataclass
@@ -114,7 +118,7 @@ class ScanSession:
         }
 
 
-app = FastAPI(title="사진 정리", version="1.1.3")
+app = FastAPI(title="사진 정리", version="1.1.4")
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"],
@@ -122,8 +126,8 @@ app.add_middleware(
 sessions: dict[str, ScanSession] = {}
 sessions_lock = threading.Lock()
 PREVIEW_CACHE_MAX_SIZE = 512
-_preview_cache_keys: OrderedDict[tuple[str, int, int], tuple[str, int]] = OrderedDict()
-_preview_cache_lock = threading.Lock()
+_preview_cache: OrderedDict[tuple[str, int, int], tuple[bytes, str]] = OrderedDict()
+_preview_cache_lock = threading.RLock()
 
 
 def _source_signature(
@@ -241,16 +245,48 @@ def _image_path(session: ScanSession, image_id: str) -> Path:
     raise HTTPException(status_code=404, detail="사진을 찾을 수 없습니다.")
 
 
-@lru_cache(maxsize=PREVIEW_CACHE_MAX_SIZE)
 def _render_image(path_text: str, modified_ns: int, max_edge: int) -> bytes:
-    del modified_ns  # Included in the cache key so replaced files invalidate naturally.
+    cache_key = (path_text, modified_ns, max_edge)
+    with _preview_cache_lock:
+        cached = _preview_cache.pop(cache_key, None)
+        if cached is not None:
+            _preview_cache[cache_key] = cached
+            return cached[0]
+
     path = Path(path_text)
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
         image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=86, optimize=True)
-        return output.getvalue()
+        data = output.getvalue()
+
+    with _preview_cache_lock:
+        _preview_cache.pop(cache_key, None)
+        _preview_cache[cache_key] = (data, str(path.parent))
+        while len(_preview_cache) > PREVIEW_CACHE_MAX_SIZE:
+            _preview_cache.popitem(last=False)
+    return data
+
+
+def _clear_preview_cache() -> int:
+    with _preview_cache_lock:
+        entry_count = len(_preview_cache)
+        _preview_cache.clear()
+        return entry_count
+
+
+def _clear_preview_cache_folder(folder: Path) -> tuple[int, int]:
+    target = str(folder.expanduser().resolve())
+    with _preview_cache_lock:
+        matching_keys = [
+            key for key, (_, folder_text) in _preview_cache.items()
+            if folder_text == target
+        ]
+        removed_bytes = sum(len(_preview_cache[key][0]) for key in matching_keys)
+        for key in matching_keys:
+            del _preview_cache[key]
+    return len(matching_keys), removed_bytes
 
 
 def _deep_size(value: object, seen: set[int] | None = None) -> int:
@@ -288,10 +324,7 @@ def reset_calculations() -> dict:
         sessions.clear()
 
     cleared_analysis_entries = clear_analysis_cache()
-    cleared_preview_entries = _render_image.cache_info().currsize
-    _render_image.cache_clear()
-    with _preview_cache_lock:
-        _preview_cache_keys.clear()
+    cleared_preview_entries = _clear_preview_cache()
     gc.collect()
     return {
         "cleared_sessions": cleared_sessions,
@@ -320,7 +353,7 @@ def get_calculation_cache() -> dict:
         usage["analysis_bytes"] += group["estimated_bytes"]
 
     with _preview_cache_lock:
-        preview_entries = list(_preview_cache_keys.values())
+        preview_entries = [(folder_text, len(data)) for data, folder_text in _preview_cache.values()]
     for folder_text, byte_count in preview_entries:
         usage = usage_for(folder_text)
         usage["preview_count"] += 1
@@ -373,6 +406,58 @@ def get_calculation_cache() -> dict:
         "result_entry_count": sum(group["result_count"] for group in groups),
         "session_count": len(session_snapshot),
         "groups": groups,
+    }
+
+
+@app.delete("/api/calculations/cache")
+def delete_calculation_cache(request: CacheDeleteRequest) -> dict:
+    target = Path(request.folder).expanduser().resolve()
+    target_text = str(target)
+
+    with sessions_lock:
+        if any(
+            session.status in {"queued", "running", "cancelling"} or session.active_operation
+            for session in sessions.values()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="진행 중인 작업이 끝난 뒤 개별 캐시를 삭제해 주세요.",
+            )
+
+        removed_session_ids: list[str] = []
+        removed_result_entries = 0
+        for session_id, session in list(sessions.items()):
+            if session.result is None:
+                continue
+            images = [
+                image
+                for group in session.result.get("groups", [])
+                for image in group.get("images", [])
+            ]
+            matching_count = sum(
+                1 for image in images
+                if str(Path(image["path"]).parent) == target_text
+            )
+            represents_empty_folder = not images and str(Path(session.folder).expanduser().resolve()) == target_text
+            if matching_count or represents_empty_folder:
+                removed_result_entries += len(images)
+                removed_session_ids.append(session_id)
+                del sessions[session_id]
+
+    removed_analysis_entries, removed_analysis_bytes = clear_analysis_cache_folder(target)
+    removed_preview_entries, removed_preview_bytes = _clear_preview_cache_folder(target)
+    if not (removed_analysis_entries or removed_preview_entries or removed_session_ids):
+        raise HTTPException(status_code=404, detail="해당 폴더의 메모리 항목을 찾을 수 없습니다.")
+
+    gc.collect()
+    return {
+        "folder": target_text,
+        "removed_analysis_entries": removed_analysis_entries,
+        "removed_analysis_bytes": removed_analysis_bytes,
+        "removed_preview_entries": removed_preview_entries,
+        "removed_preview_bytes": removed_preview_bytes,
+        "removed_result_entries": removed_result_entries,
+        "removed_session_ids": removed_session_ids,
     }
 
 
@@ -548,13 +633,7 @@ def get_image(
     if not path.is_file():
         raise HTTPException(status_code=404, detail="원본 사진을 찾을 수 없습니다.")
     max_edge = 320 if size == "thumb" else 1400
-    cache_key = (str(path), path.stat().st_mtime_ns, max_edge)
-    data = _render_image(*cache_key)
-    with _preview_cache_lock:
-        _preview_cache_keys.pop(cache_key, None)
-        _preview_cache_keys[cache_key] = (str(path.parent), len(data))
-        while len(_preview_cache_keys) > PREVIEW_CACHE_MAX_SIZE:
-            _preview_cache_keys.popitem(last=False)
+    data = _render_image(str(path), path.stat().st_mtime_ns, max_edge)
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
